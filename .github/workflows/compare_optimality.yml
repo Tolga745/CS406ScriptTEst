@@ -38,7 +38,7 @@ jobs:
       - name: Build Main Branch
         run: |
           # Adjusted path based on your file structure
-          cd main_branch/Parallel_Computing/contree/code
+          cd main_branch/CS406ScriptTEst/contree/code
           mkdir build
           cd build
           cmake .. -DCMAKE_BUILD_TYPE=Release
@@ -49,7 +49,7 @@ jobs:
         id: run_main
         run: |
           # Adjusted path to the build folder
-          cd main_branch/Parallel_Computing/contree/code/build
+          cd main_branch/CS406ScriptTEst/contree/code/build
           
           echo "Running Main Branch implementation..."
           # ../../datasets/bank.txt is still correct because 'datasets' is a sibling of 'code'
@@ -64,7 +64,7 @@ jobs:
       - name: Build PR Branch
         run: |
           # Adjusted path for PR branch
-          cd pr_branch/Parallel_Computing/contree/code
+          cd pr_branch/CS406ScriptTEst/contree/code
           mkdir build
           cd build
           cmake .. -DCMAKE_BUILD_TYPE=Release
@@ -75,7 +75,7 @@ jobs:
         id: run_pr
         run: |
           # Adjusted path for PR branch
-          cd pr_branch/Parallel_Computing/contree/code/build
+          cd pr_branch/CS406ScriptTEst/contree/code/build
           
           echo "Running PR Branch (Parallel) implementation..."
           ./ConTree -file ../../datasets/bank.txt -max-depth 3 -time 30 > output.txt
