@@ -28,31 +28,25 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y cmake build-essential
 
-      # 4. Debug Directory Structure (Optional - helps if paths are still wrong)
-      - name: Debug Directory Structure
-        run: |
-          echo "Listing structure of main_branch:"
-          ls -R main_branch
-
-      # 5. Build the Main Branch Version
+      # 4. Build the Main Branch Version
       - name: Build Main Branch
         run: |
-          # Adjusted path based on your file structure
-          cd main_branch/CS406ScriptTEst/contree/code
+          # Go into the 'contree/code' folder inside the main branch checkout
+          cd main_branch/contree/code
           mkdir build
           cd build
           cmake .. -DCMAKE_BUILD_TYPE=Release
           cmake --build . --config Release
 
-      # 6. Run Main Branch and Capture Score
+      # 5. Run Main Branch and Capture Score
       - name: Run Main Branch Benchmark
         id: run_main
         run: |
-          # Adjusted path to the build folder
-          cd main_branch/CS406ScriptTEst/contree/code/build
+          cd main_branch/contree/code/build
           
+          # Path to datasets: ../../datasets/bank.txt
+          # (Up 1 to 'code', Up 2 to 'contree', then into 'datasets')
           echo "Running Main Branch implementation..."
-          # ../../datasets/bank.txt is still correct because 'datasets' is a sibling of 'code'
           ./ConTree -file ../../datasets/bank.txt -max-depth 3 -time 30 > output.txt
           
           cat output.txt
@@ -60,22 +54,21 @@ jobs:
           echo "Main Branch Score: $SCORE"
           echo "main_score=$SCORE" >> $GITHUB_OUTPUT
 
-      # 7. Build the PR Branch Version
+      # 6. Build the PR Branch Version
       - name: Build PR Branch
         run: |
-          # Adjusted path for PR branch
-          cd pr_branch/CS406ScriptTEst/contree/code
+          # Go into the 'contree/code' folder inside the PR branch checkout
+          cd pr_branch/contree/code
           mkdir build
           cd build
           cmake .. -DCMAKE_BUILD_TYPE=Release
           cmake --build . --config Release
 
-      # 8. Run PR Branch and Capture Score
+      # 7. Run PR Branch and Capture Score
       - name: Run PR Branch Benchmark
         id: run_pr
         run: |
-          # Adjusted path for PR branch
-          cd pr_branch/CS406ScriptTEst/contree/code/build
+          cd pr_branch/contree/code/build
           
           echo "Running PR Branch (Parallel) implementation..."
           ./ConTree -file ../../datasets/bank.txt -max-depth 3 -time 30 > output.txt
@@ -85,7 +78,7 @@ jobs:
           echo "PR Branch Score: $SCORE"
           echo "pr_score=$SCORE" >> $GITHUB_OUTPUT
 
-      # 9. Compare Results
+      # 8. Compare Results
       - name: Compare Optimality
         run: |
           MAIN_SCORE=${{ steps.run_main.outputs.main_score }}
