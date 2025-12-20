@@ -29,6 +29,7 @@ jobs:
           sudo apt-get install -y cmake build-essential
 
       # 4. Build the Main Branch Version
+      # Change OMP_NUM_THREADS if you want more threads
       - name: Build Main Branch
         run: |
           # Go into the 'contree/code' folder inside the main branch checkout
@@ -46,6 +47,7 @@ jobs:
           
           # Path to datasets: ../../datasets/bank.txt
           # (Up 1 to 'code', Up 2 to 'contree', then into 'datasets')
+          export OMP_NUM_THREADS=2
           echo "Running Main Branch implementation..."
           ./ConTree -file ../../datasets/magic.txt -max-depth 3 -time 60 > output.txt
           
@@ -64,13 +66,14 @@ jobs:
           cmake .. -DCMAKE_BUILD_TYPE=Release
           cmake --build . --config Release
 
-      # 7. Run PR Branch and Capture Score
+      # 7. Run PR Branch and Capture 
+      # Change OMP_NUM_THREADS if you want more threads
       - name: Run PR Branch Benchmark
         id: run_pr
         run: |
           cd pr_branch/contree/code/build
-
-          export OMP_NUM_THREADS=2
+          
+          export OMP_NUM_THREADS=2 
           echo "Running PR Branch (Parallel) implementation..."
           ./ConTree -file ../../datasets/magic.txt -max-depth 3 -time 60 > output.txt
           
