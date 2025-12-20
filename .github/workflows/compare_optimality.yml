@@ -69,7 +69,8 @@ jobs:
         id: run_pr
         run: |
           cd pr_branch/contree/code/build
-          
+
+          export OMP_NUM_THREADS=4
           echo "Running PR Branch (Parallel) implementation..."
           ./ConTree -file ../../datasets/bank.txt -max-depth 3 -time 30 > output.txt
           
