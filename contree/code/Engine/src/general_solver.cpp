@@ -1,4 +1,5 @@
 #include "general_solver.h"
+#include <omp.h>
 
 void GeneralSolver::create_optimal_decision_tree(const Dataview& dataview, const Configuration& solution_configuration, std::shared_ptr<Tree>& current_optimal_decision_tree, int upper_bound) {
     if (current_optimal_decision_tree->misclassification_score == 0 || dataview.get_dataset_size() == 0) {
@@ -26,15 +27,49 @@ void GeneralSolver::create_optimal_decision_tree(const Dataview& dataview, const
         return;
     }
 
-    for (int feature_nr = 0; feature_nr < dataview.get_feature_number(); feature_nr++) {
-        int feature_index = dataview.gini_values[feature_nr].second;
-        create_optimal_decision_tree(dataview, solution_configuration, feature_index, current_optimal_decision_tree, std::min(upper_bound, current_optimal_decision_tree->misclassification_score));
+    // OpenMP Parallelization Start
+    // We strictly use parallelism only at the root to avoid overhead and nested parallelism issues.
+    // 'schedule(dynamic)' is used because different features may take vastly different times to process.
+    
+    // We track the best score found so far globally to help threads prune early
+    int global_best_score = current_optimal_decision_tree->misclassification_score;
 
-        if (current_optimal_decision_tree->misclassification_score == 0) {
-            return;
+    #pragma omp parallel for schedule(dynamic) if(solution_configuration.is_root) 
+    for (int feature_nr = 0; feature_nr < dataview.get_feature_number(); feature_nr++) {
+        
+        // Check if another thread already found a perfect tree (score 0) or if time is up
+        if (global_best_score == 0 || !solution_configuration.stopwatch.IsWithinTimeLimit()) {
+            continue; 
         }
-        if (!solution_configuration.stopwatch.IsWithinTimeLimit()) return;
+
+        int feature_index = dataview.gini_values[feature_nr].second;
+        
+        // Create a thread-local candidate tree initialized with the current best score bound.
+        // We cannot pass the global pointer because this function modifies it.
+        std::shared_ptr<Tree> local_tree = std::make_shared<Tree>();
+        local_tree->misclassification_score = global_best_score; 
+
+        // Run the solver on this specific feature using the local tree
+        create_optimal_decision_tree(dataview, solution_configuration, feature_index, local_tree, std::min(upper_bound, global_best_score));
+
+        // Critical section: Check if the local result is better than the global result
+        if (local_tree->misclassification_score < global_best_score) {
+            #pragma omp critical
+            {
+                // Re-check inside critical section in case another thread updated it in the meantime
+                if (local_tree->misclassification_score < current_optimal_decision_tree->misclassification_score) {
+                    current_optimal_decision_tree = local_tree;
+                    global_best_score = current_optimal_decision_tree->misclassification_score;
+                }
+            }
+        }
     }
+    // OpenMP Parallelization End
+
+    if (current_optimal_decision_tree->misclassification_score == 0) {
+        return;
+    }
+    if (!solution_configuration.stopwatch.IsWithinTimeLimit()) return;
 
     if (current_optimal_decision_tree->misclassification_score <= upper_bound) {
         Cache::global_cache.store(dataview, solution_configuration.max_depth, current_optimal_decision_tree);
