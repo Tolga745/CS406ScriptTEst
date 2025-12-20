@@ -66,7 +66,7 @@ void create_optimal_decision_tree(std::string file_name, int run_number, Configu
 
 int main(int argc, char *argv[]) {
     ParameterHandler parameters = ParameterHandler::DefineParameters();
-
+    //Adding comment to check script
     bool verbose = true;
     if (argc <= 1) {
         std::cout << "No parameters specified." << std::endl << std::endl;
