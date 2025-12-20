@@ -47,7 +47,7 @@ jobs:
           # Path to datasets: ../../datasets/bank.txt
           # (Up 1 to 'code', Up 2 to 'contree', then into 'datasets')
           echo "Running Main Branch implementation..."
-          ./ConTree -file ../../datasets/bank.txt -max-depth 3 -time 30 > output.txt
+          ./ConTree -file ../../datasets/bank.txt -max-depth 4 -time 60 > output.txt
           
           cat output.txt
           SCORE=$(grep "Misclassification score:" output.txt | awk '{print $3}')
@@ -72,7 +72,7 @@ jobs:
 
           export OMP_NUM_THREADS=2
           echo "Running PR Branch (Parallel) implementation..."
-          ./ConTree -file ../../datasets/bank.txt -max-depth 3 -time 30 > output.txt
+          ./ConTree -file ../../datasets/bank.txt -max-depth 4 -time 40 > output.txt
           
           cat output.txt
           SCORE=$(grep "Misclassification score:" output.txt | awk '{print $3}')
