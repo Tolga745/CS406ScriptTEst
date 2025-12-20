@@ -1,0 +1,2 @@
+# Include everything in the code folder
+recursive-include code *
