@@ -3,6 +3,8 @@ project(ConTree)
 
 set(CMAKE_CXX_STANDARD 17)
 
+find_package(OpenMP REQUIRED)
+
 include(CheckIPOSupported)
 check_ipo_supported(RESULT ipo_supported OUTPUT ipo_error)
 
@@ -54,6 +56,8 @@ include_directories(${INCLUDE_DIRS})
 
 # Create the executable
 add_executable(ConTree ${SRC_FILES})
+
+target_link_libraries(ConTree PUBLIC OpenMP::OpenMP_CXX)
 
 # Set target properties based on build type
 if (CMAKE_BUILD_TYPE STREQUAL Release)        
