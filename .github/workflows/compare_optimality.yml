@@ -46,7 +46,7 @@ jobs:
           SCRIPT_PATH="$CODE_DIR/Utilities/verify_optimality.py"
           
           # 4. Find the baseline file
-          BASELINE_PATH=$(find . -name "baseline_results.txt" -not -path "*/build/*" | head -n 1)
+          BASELINE_PATH=$(find . -name "baseline.txt" -not -path "*/build/*" | head -n 1)
 
           # Debugging Prints
           echo "----------------------------------------"
