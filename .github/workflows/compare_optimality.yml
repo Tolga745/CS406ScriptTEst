@@ -1,103 +1,60 @@
-name: Compare Tree Optimality
+name: Verify Optimal Tree Correctness
 
 on:
   pull_request:
     branches: [ "main" ]
 
 jobs:
-  benchmark-optimality:
+  verify-correctness:
     runs-on: ubuntu-latest
 
     steps:
-      # 1. Checkout the code from the Pull Request (The new parallel implementation)
-      - name: Checkout PR Branch
+      - name: Checkout Code
         uses: actions/checkout@v3
-        with:
-          path: pr_branch
 
-      # 2. Checkout the code from the Main Branch (The baseline)
-      - name: Checkout Main Branch
-        uses: actions/checkout@v3
-        with:
-          ref: main
-          path: main_branch
-
-      # 3. Install CMake and Build Tools
       - name: Install Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake build-essential
+          sudo apt-get install -y cmake build-essential python3
 
-      # 4. Build the Main Branch Version
-      # Change OMP_NUM_THREADS if you want more threads
-      - name: Build Main Branch
+      - name: Build Code
         run: |
-          # Go into the 'contree/code' folder inside the main branch checkout
-          cd main_branch/contree/code
+          # Find the main.cpp file to locate the code directory
+          # This ensures it works even if folder names change
+          CODE_DIR=$(find . -type f -name "main.cpp" -exec dirname {} \; | head -n 1)
+          cd "$CODE_DIR"
+          
           mkdir build
           cd build
           cmake .. -DCMAKE_BUILD_TYPE=Release
           cmake --build . --config Release
 
-      # 5. Run Main Branch and Capture Score
-      - name: Run Main Branch Benchmark
-        id: run_main
+      - name: Run Verification Script
         run: |
-          cd main_branch/contree/code/build
+          # 1. Find the compiled executable
+          CODE_DIR=$(find . -type f -name "main.cpp" -exec dirname {} \; | head -n 1)
+          EXECUTABLE="$CODE_DIR/build/ConTree"
           
-          # Path to datasets: ../../datasets/bank.txt
-          # (Up 1 to 'code', Up 2 to 'contree', then into 'datasets')
-          export OMP_NUM_THREADS=2
-          echo "Running Main Branch implementation..."
-          ./ConTree -file ../../datasets/magic.txt -max-depth 3 -time 60 > output.txt
+          # 2. Find the verification python script
+          SCRIPT_PATH="$CODE_DIR/Utilities/verify_optimality.py"
           
-          cat output.txt
-          SCORE=$(grep "Misclassification score:" output.txt | awk '{print $3}')
-          echo "Main Branch Score: $SCORE"
-          echo "main_score=$SCORE" >> $GITHUB_OUTPUT
+          # 3. Find the baseline results file
+          BASELINE_PATH=$(find . -maxdepth 4 -name "baseline_results.txt" | head -n 1)
 
-      # 6. Build the PR Branch Version
-      - name: Build PR Branch
-        run: |
-          # Go into the 'contree/code' folder inside the PR branch checkout
-          cd pr_branch/contree/code
-          mkdir build
-          cd build
-          cmake .. -DCMAKE_BUILD_TYPE=Release
-          cmake --build . --config Release
+          # Safety Checks
+          if [ ! -f "$EXECUTABLE" ]; then
+             echo "::error::Executable not found at $EXECUTABLE"
+             exit 1
+          fi
 
-      # 7. Run PR Branch and Capture 
-      # Change OMP_NUM_THREADS if you want more threads
-      - name: Run PR Branch Benchmark
-        id: run_pr
-        run: |
-          cd pr_branch/contree/code/build
-          
-          export OMP_NUM_THREADS=2 
-          echo "Running PR Branch (Parallel) implementation..."
-          ./ConTree -file ../../datasets/magic.txt -max-depth 3 -time 60 > output.txt
-          
-          cat output.txt
-          SCORE=$(grep "Misclassification score:" output.txt | awk '{print $3}')
-          echo "PR Branch Score: $SCORE"
-          echo "pr_score=$SCORE" >> $GITHUB_OUTPUT
-
-      # 8. Compare Results
-      - name: Compare Optimality
-        run: |
-          MAIN_SCORE=${{ steps.run_main.outputs.main_score }}
-          PR_SCORE=${{ steps.run_pr.outputs.pr_score }}
-
-          echo "----------------------------------------"
-          echo "Baseline (Main) Misclassification Score: $MAIN_SCORE"
-          echo "New (PR) Misclassification Score:        $PR_SCORE"
-          echo "----------------------------------------"
-
-          if [ "$PR_SCORE" -lt "$MAIN_SCORE" ]; then
-            echo "✅ SUCCESS: The new implementation found a MORE optimal tree!"
-          elif [ "$PR_SCORE" -eq "$MAIN_SCORE" ]; then
-            echo "✅ NEUTRAL: The new implementation found an EQUALLY optimal tree."
-          else
-            echo "❌ FAILURE: The new implementation found a LESS optimal (worse) tree."
+          if [ -z "$BASELINE_PATH" ]; then
+            echo "::error::Could not find baseline_results.txt in the repository!"
             exit 1
           fi
+
+          echo "Running verification..."
+          echo "Executable: $EXECUTABLE"
+          echo "Baseline:   $BASELINE_PATH"
+          
+          # Run the script (Depth limits are handled inside verify_optimality.py)
+          python3 "$SCRIPT_PATH" --executable "$EXECUTABLE" --baseline "$BASELINE_PATH"
