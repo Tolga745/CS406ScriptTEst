@@ -19,31 +19,48 @@ jobs:
 
       - name: Build Code
         run: |
-          # Find the main.cpp file to locate the code directory
-          # This ensures it works even if folder names change
-          CODE_DIR=$(find . -type f -name "main.cpp" -exec dirname {} \; | head -n 1)
+          # Robustly find the directory containing the REAL main.cpp
+          # We exclude 'build' and 'CMakeFiles' to avoid finding temporary test files
+          CODE_DIR=$(find . -name "main.cpp" -not -path "*/build/*" -not -path "*/CMakeFiles/*" -exec dirname {} \; | head -n 1)
+          
+          echo "Found source code directory: $CODE_DIR"
           cd "$CODE_DIR"
           
+          # Clean build setup
+          rm -rf build
           mkdir build
           cd build
+          
           cmake .. -DCMAKE_BUILD_TYPE=Release
           cmake --build . --config Release
 
       - name: Run Verification Script
         run: |
-          # 1. Find the compiled executable
-          CODE_DIR=$(find . -type f -name "main.cpp" -exec dirname {} \; | head -n 1)
+          # 1. Find the code directory again using the same safe logic
+          CODE_DIR=$(find . -name "main.cpp" -not -path "*/build/*" -not -path "*/CMakeFiles/*" -exec dirname {} \; | head -n 1)
+          
+          # 2. Construct path to the executable we just built
           EXECUTABLE="$CODE_DIR/build/ConTree"
           
-          # 2. Find the verification python script
+          # 3. Find the python script
           SCRIPT_PATH="$CODE_DIR/Utilities/verify_optimality.py"
           
-          # 3. Find the baseline results file
-          BASELINE_PATH=$(find . -maxdepth 4 -name "baseline_results.txt" | head -n 1)
+          # 4. Find the baseline file
+          BASELINE_PATH=$(find . -name "baseline_results.txt" -not -path "*/build/*" | head -n 1)
+
+          # Debugging Prints
+          echo "----------------------------------------"
+          echo "Source Dir: $CODE_DIR"
+          echo "Executable: $EXECUTABLE"
+          echo "Script:     $SCRIPT_PATH"
+          echo "Baseline:   $BASELINE_PATH"
+          echo "----------------------------------------"
 
           # Safety Checks
           if [ ! -f "$EXECUTABLE" ]; then
              echo "::error::Executable not found at $EXECUTABLE"
+             # Fallback check: list the build dir to see where it went
+             ls -R "$CODE_DIR/build"
              exit 1
           fi
 
@@ -52,9 +69,5 @@ jobs:
             exit 1
           fi
 
-          echo "Running verification..."
-          echo "Executable: $EXECUTABLE"
-          echo "Baseline:   $BASELINE_PATH"
-          
-          # Run the script (Depth limits are handled inside verify_optimality.py)
+          # Run the verification
           python3 "$SCRIPT_PATH" --executable "$EXECUTABLE" --baseline "$BASELINE_PATH"
