@@ -91,7 +91,7 @@ def main():
 
         for depth in range(1, file_limit + 1): 
             
-           cmd = [args.executable, "-file", dataset_path, "-max-depth", str(depth), "-time", "7200"]
+            cmd = [args.executable, "-file", dataset_path, "-max-depth", str(depth), "-time", "7200"]
             
             try:
                 result = subprocess.run(cmd, capture_output=True, text=True)
