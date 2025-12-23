@@ -5,7 +5,7 @@ import sys
 import argparse
 
 # --- CONFIGURATION ---
-DATASET_REL_PATH = "../../../datasets" 
+DATASET_REL_PATH = "../../datasets" 
 
 # Define specific depth limits for "Big" datasets to save time.
 # If a dataset is not listed here, it defaults to checking up to Depth 5.
