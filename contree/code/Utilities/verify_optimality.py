@@ -9,18 +9,33 @@ DATASET_REL_PATH = "../../datasets"
 
 # Define specific depth limits for "Big" datasets to save time.
 # If a dataset is not listed here, it defaults to checking up to Depth 5.
+# Updated limits based on your logs to stay under GitHub's 6h limit
 DEPTH_LIMITS = {
-    "skin.txt": 3,      # Very large, stop at depth 3
-    "magic.txt": 4,     # Hard, stop at depth 4
-    "segment.txt": 4,   # Hard, stop at depth 4
-    "page.txt": 4,      # Medium, stop at depth 4
-    "eeg.txt": 4,
-    "bean.txt": 4,
-    "avila.txt": 4,
+    # Extremely heavy (Cut early)
+    "skin.txt": 3,
+    "magic.txt": 2,     # Depth 3 took ~3 mins, Depth 4 timed out
+    "avila.txt": 3,     # Depth 3 took 46s, Depth 4 timed out
+    "bean.txt": 3,      # Depth 3 took 75s (too slow for CI)
+    "eeg.txt": 3,       # Depth 3 took ~3 mins
+    "htru.txt": 2,      # Depth 3 took ~3.5 mins
+    
+    # Moderately heavy (Cut at medium depth)
+    "segment.txt": 4,   # Depth 3 is 5s, Depth 4 is 5 mins
+    "page.txt": 4,      # Depth 3 is 4s, Depth 4 is 10 mins
+    "rice.txt": 3,      # Depth 3 is 22s, Depth 4 timed out
+    "occupancy.txt": 3, # Depth 3 is 25s, Depth 4 timed out
+    "raisin.txt": 4,    # Depth 3 is 1s, Depth 4 is 2 mins
+    "fault.txt": 3,     # Depth 3 is 34s, Depth 4 timed out
+    "bidding.txt": 4,   # Depth 3 is 5s, Depth 4 is 26s (Safe, but 3 is enough)
+    
+    # Safe to go deeper (or finish quickly)
+    "wilt.txt": 5,      # Depth 4 is 38s
+    "room.txt": 5,      # Depth 5 is 107s
+    "bank.txt": 5,
 }
 
-# Global default limit
-DEFAULT_MAX_DEPTH = 5
+# Reduce default to 3 just to be safe for any unknown files
+DEFAULT_MAX_DEPTH = 3
 # ---------------------
 
 def parse_output(output):
@@ -91,7 +106,7 @@ def main():
 
         for depth in range(1, file_limit + 1): 
             
-            cmd = [args.executable, "-file", dataset_path, "-max-depth", str(depth), "-time", "7200"]
+            cmd = [args.executable, "-file", dataset_path, "-max-depth", str(depth)]
             
             try:
                 result = subprocess.run(cmd, capture_output=True, text=True)
