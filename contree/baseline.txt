@@ -56,7 +56,7 @@ raisin.txt, 4, 74
 raisin.txt, 5, 48
 rice.txt, 1, 271
 rice.txt, 2, 257
-rice.txt, 3, 245
+rice.txt, 3, 243
 rice.txt, 4, 224
 rice.txt, 5, 186
 room.txt, 1, 1153
