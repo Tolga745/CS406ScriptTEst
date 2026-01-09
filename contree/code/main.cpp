@@ -13,6 +13,8 @@
 #include "statistics.h"
 #include "tree.h"
 
+#include "gpu_solver.cuh"
+
 void create_optimal_decision_tree(std::string file_name, int run_number, Configuration& config, double runtime_limit) {
     long long total_time = 0;
     int instance_number = -1;
@@ -33,6 +35,8 @@ void create_optimal_decision_tree(std::string file_name, int run_number, Configu
 
         Dataview dataview = Dataview(&sorted_dataset, &unsorted_dataset, class_number, config.sort_gini);
 
+        global_gpu_dataset.initialize(sorted_dataset);
+
         optimal_decision_tree = std::make_shared<Tree>();
         int max_gap = config.max_gap;
         do {
@@ -43,6 +47,8 @@ void create_optimal_decision_tree(std::string file_name, int run_number, Configu
             max_gap = int(max_gap * config.max_gap_decay);
         } while (max_gap > 0);
 
+
+        global_gpu_dataset.free();
         auto stop = std::chrono::high_resolution_clock::now();
         auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(stop - start);
         total_time += duration.count();
