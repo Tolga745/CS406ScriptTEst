@@ -24,135 +24,79 @@ void SpecializedSolver::get_best_left_right_scores(const Dataview& dataview, int
         }
     }
     RUNTIME_ASSERT(split_index != -1, "Split index not found.");
-
-    const int dataset_size = dataview.get_dataset_size();
-    const int class_number = dataview.get_class_number();
-
-    RUNTIME_ASSERT(split_point > 0 && split_point < dataset_size, "left and right subtree need to be non-empty.");
-    // -----------------------------------------------------------------------------
-    // START: GPU IMPLEMENTATION
-    // -----------------------------------------------------------------------------
-
-    // 1. Prepare Data for GPU (Identify Left vs Right subset membership)
-    // We map every instance in the dataset to: 0 (Left), 1 (Right), or -1 (Inactive)
-    // The 'split_feature_split_indices' from the previous block helps, but we need a flat vector.
     
+    // 1. Prepare Data
+    int dataset_size = dataview.get_dataset_size();
     std::vector<int> active_indices;
     std::vector<int> assignments;
     active_indices.reserve(dataset_size);
     assignments.reserve(dataset_size);
 
-    // Iterate the feature we are currently splitting on (feature_index) to determine assignment
-    const auto& split_feature_data = dataview.get_sorted_dataset_feature(feature_index);
-    
-    for (const auto& element : split_feature_data) {
+    for (const auto& element : split_feature) {
         active_indices.push_back(element.data_point_index);
-        
-        // If unique_value_index < split_index, it goes Left (0), otherwise Right (1)
         int side = (element.unique_value_index < split_index) ? 0 : 1;
         assignments.push_back(side);
     }
 
-    // 2. Allocate Host Vectors for GPU Results
-    // We expect the GPU to return the best score found for every feature
+    // 2. Allocate Output Arrays
     int num_features = dataview.get_feature_number();
-    
-    // Arrays to hold results for the Left Child
-    std::vector<int> left_scores(num_features), left_labels_L(num_features), left_labels_R(num_features), left_leaf_scores(num_features);
+    std::vector<int> left_scores(num_features), left_labels_L(num_features), left_labels_R(num_features), left_child_scores_L(num_features), left_child_scores_R(num_features), left_leaf_scores(num_features), left_leaf_labels(num_features);
     std::vector<float> left_thresholds(num_features);
-    std::vector<int> right_scores(num_features), right_labels_L(num_features), right_labels_R(num_features), right_leaf_scores(num_features);
+
+    std::vector<int> right_scores(num_features), right_labels_L(num_features), right_labels_R(num_features), right_child_scores_L(num_features), right_child_scores_R(num_features), right_leaf_scores(num_features), right_leaf_labels(num_features);
     std::vector<float> right_thresholds(num_features);
 
-    // 3. Launch the Kernel
-    // (You must update the function signature in gpu_solver.cu to accept these output arrays)
+    // 3. Launch
     launch_specialized_solver_kernel(
         active_indices, assignments, upper_bound,
-        left_scores.data(), left_thresholds.data(), left_labels_L.data(), left_labels_R.data(), left_leaf_scores.data(),
-        right_scores.data(), right_thresholds.data(), right_labels_L.data(), right_labels_R.data(), right_leaf_scores.data()
+        left_scores.data(), left_thresholds.data(), left_labels_L.data(), left_labels_R.data(), left_child_scores_L.data(), left_child_scores_R.data(), left_leaf_scores.data(), left_leaf_labels.data(),
+        right_scores.data(), right_thresholds.data(), right_labels_L.data(), right_labels_R.data(), right_child_scores_L.data(), right_child_scores_R.data(), right_leaf_scores.data(), right_leaf_labels.data()
     );
 
-    // 4. Process GPU Results (Find the single best feature for Left and Right trees)
-    
-    // Best Left Tree
+    // 4. Process Left Results
     int best_L_idx = -1;
-    // Base Score is the Leaf Error (all features report same leaf error, just pick index 0)
-    int leaf_score_L = left_leaf_scores[0]; 
-
     for(int i=0; i<num_features; ++i) {
         if(best_L_idx == -1 || left_scores[i] < left_scores[best_L_idx]) {
             best_L_idx = i;
         }
     }
-
-    if (best_L_idx != -1) {
-        // If the best split found is NOT better than the leaf score, force leaf.
-        if (left_scores[best_L_idx] >= leaf_score_L) {
-             // Calculate Majority Class for Leaf Label (not returned explicitly, but implicit in error)
-             // Simpler: Just rely on tree logic? No, we must call make_leaf.
-             // We can infer label? No.
-             // Actually, if we just set score = leaf_score_L, the GeneralSolver/Tree logic usually handles it?
-             // No, we must populate the tree object.
-             // Re-use logic: calculate leaf label on CPU is cheap if we know we are leafing.
-             // OR: Modify kernel to return leaf label.
-             // FAST FIX: Use the 'make_leaf' with a placeholder if we don't have the label? 
-             // Ideally, we replicate 'calculate_leaf_node' logic here.
-             
-             // Since we don't have the label handy from the kernel (I didn't add it), 
-             // let's trust the Tree to stay as is? No, it's -1.
-             // We MUST set the score.
-             left_optimal_dt->misclassification_score = leaf_score_L;
-             
-             // To set the label correctly:
-             // Use Dataview helper? 'calculate_leaf_node' exists in GeneralSolver.
-             // SpecializedSolver doesn't usually call it.
-             // We can just find the label from the GPU output "best_labels_L" logic? No that's for children.
-             
-             // FOR NOW: Let's assume the split is valid if score < leaf_score.
-             // If score == leaf_score, we accept the split (it's valid, just useless).
-             // This avoids the "no label" issue.
-             left_optimal_dt->update_split(
-                best_L_idx, left_thresholds[best_L_idx], 
-                std::make_shared<Tree>(left_labels_L[best_L_idx], -1), 
-                std::make_shared<Tree>(left_labels_R[best_L_idx], -1)
-            );
-        } else {
-            // Valid split
-            left_optimal_dt->misclassification_score = left_scores[best_L_idx];
-            left_optimal_dt->update_split(
-                best_L_idx, left_thresholds[best_L_idx], 
-                std::make_shared<Tree>(left_labels_L[best_L_idx], -1), 
-                std::make_shared<Tree>(left_labels_R[best_L_idx], -1)
-            );
-        }
+    
+    // Check if we found a valid split that is BETTER than the leaf score
+    // (If kernel didn't find split, left_scores == left_leaf_scores)
+    int leaf_score_L = left_leaf_scores[0]; 
+    if (best_L_idx != -1 && left_scores[best_L_idx] < leaf_score_L) {
+        // We have a good split!
+        left_optimal_dt->misclassification_score = left_scores[best_L_idx];
+        left_optimal_dt->update_split(
+            best_L_idx, left_thresholds[best_L_idx], 
+            std::make_shared<Tree>(left_labels_L[best_L_idx], left_child_scores_L[best_L_idx]), 
+            std::make_shared<Tree>(left_labels_R[best_L_idx], left_child_scores_R[best_L_idx])
+        );
     } else {
-        // Fallback (Should typically not happen with initialized arrays)
-        left_optimal_dt->misclassification_score = leaf_score_L;
+        // No split found, or split is not better than just being a leaf.
+        // Make it a leaf!
+        left_optimal_dt->make_leaf(left_leaf_labels[0], leaf_score_L);
     }
 
-    // --- PROCESS RIGHT NODE ---
+    // 5. Process Right Results
     int best_R_idx = -1;
-    int leaf_score_R = right_leaf_scores[0];
-
     for(int i=0; i<num_features; ++i) {
         if(best_R_idx == -1 || right_scores[i] < right_scores[best_R_idx]) {
             best_R_idx = i;
         }
     }
 
-    if (best_R_idx != -1) {
+    int leaf_score_R = right_leaf_scores[0];
+    if (best_R_idx != -1 && right_scores[best_R_idx] < leaf_score_R) {
         right_optimal_dt->misclassification_score = right_scores[best_R_idx];
         right_optimal_dt->update_split(
             best_R_idx, right_thresholds[best_R_idx], 
-            std::make_shared<Tree>(right_labels_L[best_R_idx], -1), 
-            std::make_shared<Tree>(right_labels_R[best_R_idx], -1)
+            std::make_shared<Tree>(right_labels_L[best_R_idx], right_child_scores_L[best_R_idx]), 
+            std::make_shared<Tree>(right_labels_R[best_R_idx], right_child_scores_R[best_R_idx])
         );
     } else {
-        right_optimal_dt->misclassification_score = leaf_score_R;
+        right_optimal_dt->make_leaf(right_leaf_labels[0], leaf_score_R);
     }
-
-    // -----------------------------------------------------------------------------
-    // END: GPU IMPLEMENTATION
-    // -----------------------------------------------------------------------------
 }
 
 

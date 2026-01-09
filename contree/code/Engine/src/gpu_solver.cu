@@ -29,11 +29,15 @@ __global__ void compute_splits_kernel(
     int num_instances,
     int num_classes,
     
+    // Left Outputs
     int* best_scores_left, float* best_thresholds_left, int* best_labels_left_L, int* best_labels_left_R,
-    int* leaf_scores_left, // Output for Leaf Error (Left Node)
+    int* best_child_scores_left_L, int* best_child_scores_left_R,
+    int* leaf_scores_left, int* leaf_labels_left,
 
+    // Right Outputs
     int* best_scores_right, float* best_thresholds_right, int* best_labels_right_L, int* best_labels_right_R,
-    int* leaf_scores_right // Output for Leaf Error (Right Node)
+    int* best_child_scores_right_L, int* best_child_scores_right_R,
+    int* leaf_scores_right, int* leaf_labels_right
 ) {
     int feature_idx = blockIdx.x;
     if (feature_idx >= num_features) return;
@@ -54,7 +58,7 @@ __global__ void compute_splits_kernel(
         int end_idx = feature_offsets[feature_idx + 1];
         int count = end_idx - start_idx;
 
-        // --- PASS 1: Total Counts & LEAF SCORES ---
+        // --- PASS 1: Total Counts & LEAF INFO ---
         int total_L_size = 0;
         int total_R_size = 0;
 
@@ -72,17 +76,24 @@ __global__ void compute_splits_kernel(
             }
         }
 
-        // Calculate and Store Leaf Scores
-        int dummy_lbl;
-        int leaf_err_L = calculate_misclassification(total_counts_L, num_classes, total_L_size, dummy_lbl);
-        int leaf_err_R = calculate_misclassification(total_counts_R, num_classes, total_R_size, dummy_lbl);
+        // Calculate Leaf Scores/Labels (Default if we don't split)
+        int leaf_lbl_L, leaf_lbl_R;
+        int leaf_err_L = calculate_misclassification(total_counts_L, num_classes, total_L_size, leaf_lbl_L);
+        int leaf_err_R = calculate_misclassification(total_counts_R, num_classes, total_R_size, leaf_lbl_R);
         
         leaf_scores_left[feature_idx] = leaf_err_L;
+        leaf_labels_left[feature_idx] = leaf_lbl_L;
+        
         leaf_scores_right[feature_idx] = leaf_err_R;
+        leaf_labels_right[feature_idx] = leaf_lbl_R;
 
-        // Initialize Split Scores to Leaf Error (Default: No Split)
+        // Initialize Best Scores
         best_scores_left[feature_idx] = leaf_err_L; 
         best_scores_right[feature_idx] = leaf_err_R;
+        
+        // Init child scores to dummy (will be overwritten if split found, or ignored if leaf)
+        best_child_scores_left_L[feature_idx] = -1; best_child_scores_left_R[feature_idx] = -1;
+        best_child_scores_right_L[feature_idx] = -1; best_child_scores_right_R[feature_idx] = -1;
 
         // --- PASS 2: Find Best Split ---
         int curr_L_size = 0;
@@ -102,7 +113,7 @@ __global__ void compute_splits_kernel(
             if (value_changed) {
                 float threshold = (prev_value + val) * 0.5f;
 
-                // Check Split for LEFT Node
+                // LEFT Node Split Check
                 if (curr_L_size > 0 && curr_L_size < total_L_size) {
                     int l_lbl, r_lbl;
                     int score_L = calculate_misclassification(curr_counts_L, num_classes, curr_L_size, l_lbl);
@@ -120,10 +131,13 @@ __global__ void compute_splits_kernel(
                         best_thresholds_left[feature_idx] = threshold;
                         best_labels_left_L[feature_idx] = l_lbl;
                         best_labels_left_R[feature_idx] = r_lbl;
+                        // Store individual scores!
+                        best_child_scores_left_L[feature_idx] = score_L;
+                        best_child_scores_left_R[feature_idx] = score_R;
                     }
                 }
 
-                // Check Split for RIGHT Node
+                // RIGHT Node Split Check
                 if (curr_R_size > 0 && curr_R_size < total_R_size) {
                     int l_lbl, r_lbl;
                     int score_L = calculate_misclassification(curr_counts_R, num_classes, curr_R_size, l_lbl);
@@ -141,6 +155,8 @@ __global__ void compute_splits_kernel(
                         best_thresholds_right[feature_idx] = threshold;
                         best_labels_right_L[feature_idx] = l_lbl;
                         best_labels_right_R[feature_idx] = r_lbl;
+                        best_child_scores_right_L[feature_idx] = score_L;
+                        best_child_scores_right_R[feature_idx] = score_R;
                     }
                 }
             }
@@ -159,8 +175,8 @@ void launch_specialized_solver_kernel(
     const std::vector<int>& active_indices,
     const std::vector<int>& split_assignment,
     int upper_bound,
-    int* h_best_scores_left, float* h_best_thresholds_left, int* h_best_labels_left_L, int* h_best_labels_left_R, int* h_leaf_scores_left,
-    int* h_best_scores_right, float* h_best_thresholds_right, int* h_best_labels_right_L, int* h_best_labels_right_R, int* h_leaf_scores_right
+    int* h_best_scores_left, float* h_best_thresholds_left, int* h_best_labels_left_L, int* h_best_labels_left_R, int* h_best_child_scores_left_L, int* h_best_child_scores_left_R, int* h_leaf_scores_left, int* h_leaf_labels_left,
+    int* h_best_scores_right, float* h_best_thresholds_right, int* h_best_labels_right_L, int* h_best_labels_right_R, int* h_best_child_scores_right_L, int* h_best_child_scores_right_R, int* h_leaf_scores_right, int* h_leaf_labels_right
 ) {
     int* d_assignment;
     cudaMalloc(&d_assignment, global_gpu_dataset.num_instances * sizeof(int));
@@ -174,24 +190,28 @@ void launch_specialized_solver_kernel(
     size_t int_bytes = num_feats * sizeof(int);
     size_t float_bytes = num_feats * sizeof(float);
 
-    int *d_score_L, *d_lbl_L_L, *d_lbl_L_R, *d_leaf_L;
+    int *d_score_L, *d_lbl_L_L, *d_lbl_L_R, *d_cscore_L_L, *d_cscore_L_R, *d_leaf_L, *d_leaflbl_L;
     float *d_thresh_L;
-    int *d_score_R, *d_lbl_R_L, *d_lbl_R_R, *d_leaf_R;
+    int *d_score_R, *d_lbl_R_L, *d_lbl_R_R, *d_cscore_R_L, *d_cscore_R_R, *d_leaf_R, *d_leaflbl_R;
     float *d_thresh_R;
 
     cudaMalloc(&d_score_L, int_bytes); cudaMalloc(&d_thresh_L, float_bytes);
-    cudaMalloc(&d_lbl_L_L, int_bytes); cudaMalloc(&d_lbl_L_R, int_bytes); cudaMalloc(&d_leaf_L, int_bytes);
+    cudaMalloc(&d_lbl_L_L, int_bytes); cudaMalloc(&d_lbl_L_R, int_bytes); 
+    cudaMalloc(&d_cscore_L_L, int_bytes); cudaMalloc(&d_cscore_L_R, int_bytes);
+    cudaMalloc(&d_leaf_L, int_bytes); cudaMalloc(&d_leaflbl_L, int_bytes);
 
     cudaMalloc(&d_score_R, int_bytes); cudaMalloc(&d_thresh_R, float_bytes);
-    cudaMalloc(&d_lbl_R_L, int_bytes); cudaMalloc(&d_lbl_R_R, int_bytes); cudaMalloc(&d_leaf_R, int_bytes);
+    cudaMalloc(&d_lbl_R_L, int_bytes); cudaMalloc(&d_lbl_R_R, int_bytes); 
+    cudaMalloc(&d_cscore_R_L, int_bytes); cudaMalloc(&d_cscore_R_R, int_bytes);
+    cudaMalloc(&d_leaf_R, int_bytes); cudaMalloc(&d_leaflbl_R, int_bytes);
 
     size_t shared_mem_size = 4 * global_gpu_dataset.num_classes * sizeof(int);
 
     compute_splits_kernel<<<num_feats, 1, shared_mem_size>>>(
         global_gpu_dataset.d_values, global_gpu_dataset.d_labels, global_gpu_dataset.d_original_indices, global_gpu_dataset.d_feature_offsets, d_assignment,
         num_feats, global_gpu_dataset.num_instances, global_gpu_dataset.num_classes,
-        d_score_L, d_thresh_L, d_lbl_L_L, d_lbl_L_R, d_leaf_L,
-        d_score_R, d_thresh_R, d_lbl_R_L, d_lbl_R_R, d_leaf_R
+        d_score_L, d_thresh_L, d_lbl_L_L, d_lbl_L_R, d_cscore_L_L, d_cscore_L_R, d_leaf_L, d_leaflbl_L,
+        d_score_R, d_thresh_R, d_lbl_R_L, d_lbl_R_R, d_cscore_R_L, d_cscore_R_R, d_leaf_R, d_leaflbl_R
     );
     cudaDeviceSynchronize();
 
@@ -199,21 +219,28 @@ void launch_specialized_solver_kernel(
     cudaMemcpy(h_best_thresholds_left, d_thresh_L, float_bytes, cudaMemcpyDeviceToHost);
     cudaMemcpy(h_best_labels_left_L, d_lbl_L_L, int_bytes, cudaMemcpyDeviceToHost);
     cudaMemcpy(h_best_labels_left_R, d_lbl_L_R, int_bytes, cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_best_child_scores_left_L, d_cscore_L_L, int_bytes, cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_best_child_scores_left_R, d_cscore_L_R, int_bytes, cudaMemcpyDeviceToHost);
     cudaMemcpy(h_leaf_scores_left, d_leaf_L, int_bytes, cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_leaf_labels_left, d_leaflbl_L, int_bytes, cudaMemcpyDeviceToHost);
 
     cudaMemcpy(h_best_scores_right, d_score_R, int_bytes, cudaMemcpyDeviceToHost);
     cudaMemcpy(h_best_thresholds_right, d_thresh_R, float_bytes, cudaMemcpyDeviceToHost);
     cudaMemcpy(h_best_labels_right_L, d_lbl_R_L, int_bytes, cudaMemcpyDeviceToHost);
     cudaMemcpy(h_best_labels_right_R, d_lbl_R_R, int_bytes, cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_best_child_scores_right_L, d_cscore_R_L, int_bytes, cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_best_child_scores_right_R, d_cscore_R_R, int_bytes, cudaMemcpyDeviceToHost);
     cudaMemcpy(h_leaf_scores_right, d_leaf_R, int_bytes, cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_leaf_labels_right, d_leaflbl_R, int_bytes, cudaMemcpyDeviceToHost);
 
     cudaFree(d_assignment);
-    cudaFree(d_score_L); cudaFree(d_thresh_L); cudaFree(d_lbl_L_L); cudaFree(d_lbl_L_R); cudaFree(d_leaf_L);
-    cudaFree(d_score_R); cudaFree(d_thresh_R); cudaFree(d_lbl_R_L); cudaFree(d_lbl_R_R); cudaFree(d_leaf_R);
+    cudaFree(d_score_L); cudaFree(d_thresh_L); cudaFree(d_lbl_L_L); cudaFree(d_lbl_L_R); cudaFree(d_cscore_L_L); cudaFree(d_cscore_L_R); cudaFree(d_leaf_L); cudaFree(d_leaflbl_L);
+    cudaFree(d_score_R); cudaFree(d_thresh_R); cudaFree(d_lbl_R_L); cudaFree(d_lbl_R_R); cudaFree(d_cscore_R_L); cudaFree(d_cscore_R_R); cudaFree(d_leaf_R); cudaFree(d_leaflbl_R);
 }
 
+// (GPUDataset::initialize and free remain the same as previous step, verify they are present in your file)
+// Re-paste them if you overwrote the file completely.
 void GPUDataset::initialize(const Dataset& cpu_dataset) {
-    // (Same initialization logic as before - ensure max_label is found correctly)
     num_features = cpu_dataset.get_features_size();
     num_instances = cpu_dataset.get_instance_number();
     

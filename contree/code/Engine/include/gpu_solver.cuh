@@ -19,25 +19,30 @@ struct GPUDataset {
 
 extern GPUDataset global_gpu_dataset;
 
-// UPDATED SIGNATURE: Matches the call in specialized_solver.cpp
 void launch_specialized_solver_kernel(
     const std::vector<int>& active_indices,
     const std::vector<int>& split_assignment,
     int upper_bound,
     
-    // Left Child Outputs
+    // Left Node Outputs
     int* h_best_scores_left,
     float* h_best_thresholds_left,
     int* h_best_labels_left_L,
     int* h_best_labels_left_R,
+    int* h_best_child_scores_left_L, 
+    int* h_best_child_scores_left_R, 
     int* h_leaf_scores_left,
+    int* h_leaf_labels_left,         
     
-    // Right Child Outputs
+    // Right Node Outputs
     int* h_best_scores_right,
     float* h_best_thresholds_right,
     int* h_best_labels_right_L,
     int* h_best_labels_right_R,
-    int* h_leaf_scores_right
+    int* h_best_child_scores_right_L, 
+    int* h_best_child_scores_right_R, 
+    int* h_leaf_scores_right,
+    int* h_leaf_labels_right          
 );
 
 #endif
