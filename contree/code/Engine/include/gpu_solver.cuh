@@ -30,12 +30,14 @@ void launch_specialized_solver_kernel(
     float* h_best_thresholds_left,
     int* h_best_labels_left_L,
     int* h_best_labels_left_R,
+    int* h_leaf_scores_left,
     
     // Right Child Outputs
     int* h_best_scores_right,
     float* h_best_thresholds_right,
     int* h_best_labels_right_L,
-    int* h_best_labels_right_R
+    int* h_best_labels_right_R,
+    int* h_leaf_scores_right
 );
 
 #endif
