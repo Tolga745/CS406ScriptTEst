@@ -21,7 +21,7 @@ struct GPUDataset {
     int *d_score_L, *d_lbl_L_L, *d_lbl_L_R, *d_cscore_L_L, *d_cscore_L_R, *d_leaf_L, *d_leaflbl_L;
     float *d_thresh_L;
     int *d_score_R, *d_lbl_R_L, *d_lbl_R_R, *d_cscore_R_L, *d_cscore_R_R, *d_leaf_R, *d_leaflbl_R;
-
+    float *d_thresh_R;
     void initialize(const Dataset& cpu_dataset);
     void free();
 };
