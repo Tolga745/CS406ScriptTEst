@@ -29,7 +29,7 @@ __global__ void compute_splits_kernel(
     int num_instances,
     int num_classes,
     
-    // Output pointers...
+    // Outputs...
     int* best_scores_left, float* best_thresholds_left, int* best_labels_left_L, int* best_labels_left_R,
     int* best_child_scores_left_L, int* best_child_scores_left_R,
     int* leaf_scores_left, int* leaf_labels_left,
@@ -41,15 +41,35 @@ __global__ void compute_splits_kernel(
     int feature_idx = blockIdx.x;
     if (feature_idx >= num_features) return;
 
-    extern __shared__ int shared_counts[];
-    int* total_counts_L = &shared_counts[0];
-    int* total_counts_R = &shared_counts[num_classes];
-    int* curr_counts_L  = &shared_counts[2 * num_classes];
-    int* curr_counts_R  = &shared_counts[3 * num_classes];
+    // -------------------------------------------------------------------------
+    // SHARED MEMORY LAYOUT
+    // Part 1: Privatized Counters [blockDim.x * num_classes * 2] (High usage)
+    // Part 2: Totals & Current Counts [4 * num_classes] (Small usage)
+    // -------------------------------------------------------------------------
+    extern __shared__ int shared_mem[];
+    
+    // Pointers for final totals (placed at the BEGINNING of shared mem)
+    int* total_counts_L = &shared_mem[0];
+    int* total_counts_R = &shared_mem[num_classes];
+    
+    // Pointers for private counters (placed AFTER totals)
+    // We need 2 sets (Left/Right) per thread
+    int* private_counts = &shared_mem[4 * num_classes]; // Offset to skip temp buffers
+    
+    int tid = threadIdx.x;
+    int bdim = blockDim.x;
 
-    // 1. Initialize Shared Memory in Parallel
-    for (int i = threadIdx.x; i < 4 * num_classes; i += blockDim.x) {
-        shared_counts[i] = 0;
+    // 1. Initialize Shared Memory
+    // Zero out Totals
+    if (tid < 4 * num_classes) {
+        shared_mem[tid] = 0;
+    }
+    
+    // Zero out Private Counters
+    // Size: bdim * num_classes * 2
+    int private_size = bdim * num_classes * 2;
+    for (int i = tid; i < private_size; i += bdim) {
+        private_counts[i] = 0;
     }
     __syncthreads();
 
@@ -58,68 +78,98 @@ __global__ void compute_splits_kernel(
     int count = end_idx - start_idx;
 
     // ---------------------------------------------------------
-    // OPTIMIZED PASS 1: Parallel Counting
+    // PASS 1: Parallel Counting with Private Counters (NO ATOMICS)
     // ---------------------------------------------------------
-    // All threads process the data in a "Grid Stride" pattern
-    for (int i = threadIdx.x; i < count; i += blockDim.x) {
+    for (int i = tid; i < count; i += bdim) {
         int global_idx = start_idx + i;
         int orig_idx = original_indices[global_idx];
         int assignment = active_mask[orig_idx]; 
         int label = labels[global_idx];
 
+        // Each thread writes to its own dedicated slot
+        // Slot Index = (ThreadID * num_classes * 2) + (Side * num_classes) + Label
         if (assignment == 0) {
-            atomicAdd(&total_counts_L[label], 1);
+            private_counts[tid * num_classes * 2 + 0 + label]++;
         } else if (assignment == 1) {
-            atomicAdd(&total_counts_R[label], 1);
+            private_counts[tid * num_classes * 2 + num_classes + label]++;
         }
     }
-    __syncthreads(); // Wait for all threads to finish counting
+    __syncthreads();
 
     // ---------------------------------------------------------
-    // INTERMEDIATE: Calculate Total Sizes (One thread or reduction)
+    // REDUCTION: Sum Private Counters into Totals
     // ---------------------------------------------------------
-    __shared__ int total_L_size;
-    __shared__ int total_R_size;
-    if (threadIdx.x == 0) {
-        total_L_size = 0;
-        total_R_size = 0;
+    // We iterate over Labels, then sum across Threads
+    for (int c = 0; c < num_classes; ++c) {
+        // We can let threads help sum up, or just let thread 0 do it if num_classes is small.
+        // For robustness, Thread 0 does the gathering for now (simplest correct logic).
+        // Since num_classes is usually small, this loop is short.
+        
+        // Optimally: Parallel reduction tree. 
+        // Simple: Serial sum by thread 0 is still faster than global atomic contention.
+        if (tid == 0) {
+            int sum_L = 0;
+            int sum_R = 0;
+            for (int t = 0; t < bdim; ++t) {
+                sum_L += private_counts[t * num_classes * 2 + 0 + c];
+                sum_R += private_counts[t * num_classes * 2 + num_classes + c];
+            }
+            total_counts_L[c] = sum_L;
+            total_counts_R[c] = sum_R;
+        }
+    }
+    __syncthreads();
+
+    // ---------------------------------------------------------
+    // CALCULATE LEAF SCORES
+    // ---------------------------------------------------------
+    if (tid == 0) {
+        int total_L_size = 0;
+        int total_R_size = 0;
         for(int c=0; c<num_classes; ++c) {
             total_L_size += total_counts_L[c];
             total_R_size += total_counts_R[c];
         }
 
-        // Calculate Leaf Scores (Parent Node Errors)
         int leaf_lbl_L, leaf_lbl_R;
         int leaf_err_L = calculate_misclassification(total_counts_L, num_classes, total_L_size, leaf_lbl_L);
         int leaf_err_R = calculate_misclassification(total_counts_R, num_classes, total_R_size, leaf_lbl_R);
         
-        // Write outputs
-        leaf_scores_left[feature_idx] = leaf_err_L;
-        leaf_labels_left[feature_idx] = leaf_lbl_L;
-        leaf_scores_right[feature_idx] = leaf_err_R;
-        leaf_labels_right[feature_idx] = leaf_lbl_R;
+        leaf_scores_left[feature_idx] = leaf_err_L; leaf_labels_left[feature_idx] = leaf_lbl_L;
+        leaf_scores_right[feature_idx] = leaf_err_R; leaf_labels_right[feature_idx] = leaf_lbl_R;
 
-        best_scores_left[feature_idx] = leaf_err_L; 
-        best_scores_right[feature_idx] = leaf_err_R;
-        
-        // Defaults
+        // Init Best Scores
+        best_scores_left[feature_idx] = leaf_err_L; best_scores_right[feature_idx] = leaf_err_R;
         best_child_scores_left_L[feature_idx] = -1; best_child_scores_left_R[feature_idx] = -1;
         best_child_scores_right_L[feature_idx] = -1; best_child_scores_right_R[feature_idx] = -1;
     }
     __syncthreads();
 
     // ---------------------------------------------------------
-    // PASS 2: Find Best Split
+    // PASS 2: Find Best Split (Thread 0 Only for now)
     // ---------------------------------------------------------
-    // NOTE: Fully parallelizing Pass 2 requires a Parallel Scan (Prefix Sum).
-    // For now, we keep this part serialized (Thread 0 only) to ensure correctness.
-    // However, since Pass 1 (memory intensive) is now parallel, it will be faster.
+    // Optimization Note: To parallelize this, we need Prefix Sums. 
+    // Given the constraints and current complexity, keeping this serial 
+    // is acceptable as long as counting (the heavy part) is parallel.
     
-    if (threadIdx.x == 0) {
+    if (tid == 0) {
+        // Reuse shared mem buffers for "Current Counts"
+        // total_counts_L/R are at indices [0..num_classes-1] and [num_classes..2*num_classes-1]
+        // We use indices [2*num_classes ... ] for curr_counts
+        int* curr_counts_L = &shared_mem[2 * num_classes];
+        int* curr_counts_R = &shared_mem[3 * num_classes];
+        
+        // Reset current counters
+        for(int c=0; c<num_classes; ++c) { curr_counts_L[c] = 0; curr_counts_R[c] = 0; }
+
         int curr_L_size = 0;
         int curr_R_size = 0;
         float prev_value = -999999.0f;
         if(count > 0) prev_value = values[start_idx];
+        
+        // Use Pre-calculated Totals
+        int total_L_size = 0; for(int c=0; c<num_classes; ++c) total_L_size += total_counts_L[c];
+        int total_R_size = 0; for(int c=0; c<num_classes; ++c) total_R_size += total_counts_R[c];
 
         for (int i = 0; i < count; i++) {
             int global_idx = start_idx + i;
@@ -133,7 +183,7 @@ __global__ void compute_splits_kernel(
             if (value_changed) {
                 float threshold = (prev_value + val) * 0.5f;
 
-                // LEFT Node Split Check
+                // LEFT Check
                 if (curr_L_size > 0 && curr_L_size < total_L_size) {
                     int l_lbl, r_lbl;
                     int score_L = calculate_misclassification(curr_counts_L, num_classes, curr_L_size, l_lbl);
@@ -156,7 +206,7 @@ __global__ void compute_splits_kernel(
                     }
                 }
 
-                // RIGHT Node Split Check
+                // RIGHT Check
                 if (curr_R_size > 0 && curr_R_size < total_R_size) {
                     int l_lbl, r_lbl;
                     int score_L = calculate_misclassification(curr_counts_R, num_classes, curr_R_size, l_lbl);
@@ -197,29 +247,26 @@ void launch_specialized_solver_kernel(
     int* h_best_scores_left, float* h_best_thresholds_left, int* h_best_labels_left_L, int* h_best_labels_left_R, int* h_best_child_scores_left_L, int* h_best_child_scores_left_R, int* h_leaf_scores_left, int* h_leaf_labels_left,
     int* h_best_scores_right, float* h_best_thresholds_right, int* h_best_labels_right_L, int* h_best_labels_right_R, int* h_best_child_scores_right_L, int* h_best_child_scores_right_R, int* h_leaf_scores_right, int* h_leaf_labels_right
 ) {
-    // 1. Prepare Active Mask
-    
     cudaMemset(global_gpu_dataset.d_assignment_buffer, -1, global_gpu_dataset.num_instances * sizeof(int));
-
-    // Create the CPU vector (This is still a CPU bottleneck, but we can't remove it easily yet)
     std::vector<int> full_assignment(global_gpu_dataset.num_instances, -1);
     for(size_t i=0; i<active_indices.size(); ++i) full_assignment[active_indices[i]] = split_assignment[i];
-    
-    // Copy to pre-allocated buffer
     cudaMemcpy(global_gpu_dataset.d_assignment_buffer, full_assignment.data(), global_gpu_dataset.num_instances * sizeof(int), cudaMemcpyHostToDevice);
 
-    // 2. Launch Kernel using PRE-ALLOCATED buffers
     int num_feats = global_gpu_dataset.num_features;
     size_t int_bytes = num_feats * sizeof(int);
     size_t float_bytes = num_feats * sizeof(float);
-    size_t shared_mem_size = 4 * global_gpu_dataset.num_classes * sizeof(int);
+    
+    // CALCULATE DYNAMIC SHARED MEMORY
+    // Need: [4 * num_classes] for totals + [blockDim.x * num_classes * 2] for private counters
+    // BlockDim = 256
+    int block_size = 256;
+    size_t shared_mem_size = (4 * global_gpu_dataset.num_classes + block_size * global_gpu_dataset.num_classes * 2) * sizeof(int);
 
-    compute_splits_kernel<<<num_feats, 1, shared_mem_size>>>(
+    compute_splits_kernel<<<num_feats, block_size, shared_mem_size>>>(
         global_gpu_dataset.d_values, global_gpu_dataset.d_labels, global_gpu_dataset.d_original_indices, global_gpu_dataset.d_feature_offsets, 
-        global_gpu_dataset.d_assignment_buffer, // <--- Using persistent buffer
+        global_gpu_dataset.d_assignment_buffer,
         num_feats, global_gpu_dataset.num_instances, global_gpu_dataset.num_classes,
         
-        // Output buffers (Persistent)
         global_gpu_dataset.d_score_L, global_gpu_dataset.d_thresh_L, global_gpu_dataset.d_lbl_L_L, global_gpu_dataset.d_lbl_L_R, 
         global_gpu_dataset.d_cscore_L_L, global_gpu_dataset.d_cscore_L_R, global_gpu_dataset.d_leaf_L, global_gpu_dataset.d_leaflbl_L,
 
@@ -228,7 +275,6 @@ void launch_specialized_solver_kernel(
     );
     cudaDeviceSynchronize();
 
-    // 3. Copy Results Back
     cudaMemcpy(h_best_scores_left, global_gpu_dataset.d_score_L, int_bytes, cudaMemcpyDeviceToHost);
     cudaMemcpy(h_best_thresholds_left, global_gpu_dataset.d_thresh_L, float_bytes, cudaMemcpyDeviceToHost);
     cudaMemcpy(h_best_labels_left_L, global_gpu_dataset.d_lbl_L_L, int_bytes, cudaMemcpyDeviceToHost);
@@ -246,8 +292,6 @@ void launch_specialized_solver_kernel(
     cudaMemcpy(h_best_child_scores_right_R, global_gpu_dataset.d_cscore_R_R, int_bytes, cudaMemcpyDeviceToHost);
     cudaMemcpy(h_leaf_scores_right, global_gpu_dataset.d_leaf_R, int_bytes, cudaMemcpyDeviceToHost);
     cudaMemcpy(h_leaf_labels_right, global_gpu_dataset.d_leaflbl_R, int_bytes, cudaMemcpyDeviceToHost);
-
-    
 }
 
 // (GPUDataset::initialize and free remain the same as previous step, verify they are present in your file)
