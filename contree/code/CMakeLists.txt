@@ -3,7 +3,7 @@ project(ConTree)
 project(ConTree LANGUAGES CXX CUDA)
 
 set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_CUDA_STANDARD 17)
+set(CMAKE_CUDA_STANDARD 14)
 
 find_package(OpenMP REQUIRED)
 
