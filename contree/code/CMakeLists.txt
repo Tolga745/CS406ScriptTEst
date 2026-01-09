@@ -61,6 +61,8 @@ include_directories(${INCLUDE_DIRS})
 # Create the executable
 add_executable(ConTree ${SRC_FILES})
 
+target_compile_options(ConTree PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda>)
+
 target_link_libraries(ConTree PUBLIC OpenMP::OpenMP_CXX)
 
 # Set target properties based on build type
