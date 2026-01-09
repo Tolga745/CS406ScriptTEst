@@ -29,7 +29,6 @@ __global__ void compute_splits_kernel(
     int num_instances,
     int num_classes,
     
-    // Outputs...
     int* best_scores_left, float* best_thresholds_left, int* best_labels_left_L, int* best_labels_left_R,
     int* best_child_scores_left_L, int* best_child_scores_left_R,
     int* leaf_scores_left, int* leaf_labels_left,
@@ -41,202 +40,276 @@ __global__ void compute_splits_kernel(
     int feature_idx = blockIdx.x;
     if (feature_idx >= num_features) return;
 
-    // -------------------------------------------------------------------------
-    // SHARED MEMORY LAYOUT
-    // Part 1: Privatized Counters [blockDim.x * num_classes * 2] (High usage)
-    // Part 2: Totals & Current Counts [4 * num_classes] (Small usage)
-    // -------------------------------------------------------------------------
-    extern __shared__ int shared_mem[];
-    
-    // Pointers for final totals (placed at the BEGINNING of shared mem)
-    int* total_counts_L = &shared_mem[0];
-    int* total_counts_R = &shared_mem[num_classes];
-    
-    // Pointers for private counters (placed AFTER totals)
-    // We need 2 sets (Left/Right) per thread
-    int* private_counts = &shared_mem[4 * num_classes]; // Offset to skip temp buffers
+    // Shared Memory Layout: [BlockDim * Num_Classes * 2]
+    // Stores the private counts for each thread.
+    // After Pass 1, we perform a Prefix Sum in-place on this array.
+    extern __shared__ int shared_counts[];
     
     int tid = threadIdx.x;
     int bdim = blockDim.x;
-
-    // 1. Initialize Shared Memory
-    // Zero out Totals
-    if (tid < 4 * num_classes) {
-        shared_mem[tid] = 0;
-    }
     
-    // Zero out Private Counters
-    // Size: bdim * num_classes * 2
-    int private_size = bdim * num_classes * 2;
-    for (int i = tid; i < private_size; i += bdim) {
-        private_counts[i] = 0;
-    }
-    __syncthreads();
-
     int start_idx = feature_offsets[feature_idx];
     int end_idx = feature_offsets[feature_idx + 1];
     int count = end_idx - start_idx;
 
+    // Calculate chunk size for this thread (Grid-Stride style, but we need deterministic chunks for Scan)
+    // Simple Chunking: Each thread gets a contiguous block
+    int chunk_size = (count + bdim - 1) / bdim;
+    int my_start = tid * chunk_size;
+    int my_end = min(my_start + chunk_size, count);
+
+    // 1. Initialize Shared Memory
+    int num_counters_per_thread = num_classes * 2;
+    for (int i = 0; i < num_counters_per_thread; ++i) {
+        shared_counts[tid * num_counters_per_thread + i] = 0;
+    }
+    __syncthreads();
+
     // ---------------------------------------------------------
-    // PASS 1: Parallel Counting with Private Counters (NO ATOMICS)
+    // PASS 1: Parallel Counting (Each thread counts its chunk)
     // ---------------------------------------------------------
-    for (int i = tid; i < count; i += bdim) {
+    for (int i = my_start; i < my_end; ++i) {
         int global_idx = start_idx + i;
         int orig_idx = original_indices[global_idx];
         int assignment = active_mask[orig_idx]; 
         int label = labels[global_idx];
 
-        // Each thread writes to its own dedicated slot
-        // Slot Index = (ThreadID * num_classes * 2) + (Side * num_classes) + Label
         if (assignment == 0) {
-            private_counts[tid * num_classes * 2 + 0 + label]++;
+            shared_counts[tid * num_counters_per_thread + label]++; // Left
         } else if (assignment == 1) {
-            private_counts[tid * num_classes * 2 + num_classes + label]++;
+            shared_counts[tid * num_counters_per_thread + num_classes + label]++; // Right
         }
     }
     __syncthreads();
 
     // ---------------------------------------------------------
-    // REDUCTION: Sum Private Counters into Totals
+    // PREFIX SUM (Scan) on Shared Memory
     // ---------------------------------------------------------
-    // We iterate over Labels, then sum across Threads
-    for (int c = 0; c < num_classes; ++c) {
-        // We can let threads help sum up, or just let thread 0 do it if num_classes is small.
-        // For robustness, Thread 0 does the gathering for now (simplest correct logic).
-        // Since num_classes is usually small, this loop is short.
-        
-        // Optimally: Parallel reduction tree. 
-        // Simple: Serial sum by thread 0 is still faster than global atomic contention.
-        if (tid == 0) {
-            int sum_L = 0;
-            int sum_R = 0;
-            for (int t = 0; t < bdim; ++t) {
-                sum_L += private_counts[t * num_classes * 2 + 0 + c];
-                sum_R += private_counts[t * num_classes * 2 + num_classes + c];
+    // We need to know the running total of counts BEFORE this thread's chunk.
+    // We do a naive prefix sum over threads (O(Threads^2) but Threads=256, so very fast)
+    // Each thread 'tid' sums up counts from thread 0 to tid-1.
+    
+    // Create local copy of "Starting Counts" for this thread
+    // (We use a register array if num_classes is small, assuming max 10 classes for now)
+    // Dynamic allocation not possible in registers, so we use a small buffer or re-read shared.
+    // For general safety, let's just modify shared memory in place cautiously or use a temporary buffer.
+    
+    // To allow fully parallel scan, we can just let every thread read the others.
+    // Simple iterative scan:
+    int my_starting_counts[20]; // Hardcoded max classes = 10 (Left+Right) to avoid dynamic arrays
+    for(int c=0; c<num_counters_per_thread; ++c) my_starting_counts[c] = 0;
+
+    if (tid > 0) {
+        for (int t = 0; t < tid; ++t) {
+            for (int c = 0; c < num_counters_per_thread; ++c) {
+                my_starting_counts[c] += shared_counts[t * num_counters_per_thread + c];
             }
-            total_counts_L[c] = sum_L;
-            total_counts_R[c] = sum_R;
+        }
+    }
+    
+    // Calculate TOTALS (last thread finishes the sum)
+    __shared__ int total_counts[20];
+    if (tid == bdim - 1) {
+        for (int c = 0; c < num_counters_per_thread; ++c) {
+            total_counts[c] = my_starting_counts[c] + shared_counts[tid * num_counters_per_thread + c];
         }
     }
     __syncthreads();
 
     // ---------------------------------------------------------
-    // CALCULATE LEAF SCORES
+    // CALCULATE LEAF SCORES (Thread 0)
     // ---------------------------------------------------------
     if (tid == 0) {
         int total_L_size = 0;
         int total_R_size = 0;
         for(int c=0; c<num_classes; ++c) {
-            total_L_size += total_counts_L[c];
-            total_R_size += total_counts_R[c];
+            total_L_size += total_counts[c];
+            total_R_size += total_counts[num_classes + c];
         }
 
         int leaf_lbl_L, leaf_lbl_R;
-        int leaf_err_L = calculate_misclassification(total_counts_L, num_classes, total_L_size, leaf_lbl_L);
-        int leaf_err_R = calculate_misclassification(total_counts_R, num_classes, total_R_size, leaf_lbl_R);
+        int leaf_err_L = calculate_misclassification(&total_counts[0], num_classes, total_L_size, leaf_lbl_L);
+        int leaf_err_R = calculate_misclassification(&total_counts[num_classes], num_classes, total_R_size, leaf_lbl_R);
         
         leaf_scores_left[feature_idx] = leaf_err_L; leaf_labels_left[feature_idx] = leaf_lbl_L;
         leaf_scores_right[feature_idx] = leaf_err_R; leaf_labels_right[feature_idx] = leaf_lbl_R;
-
-        // Init Best Scores
-        best_scores_left[feature_idx] = leaf_err_L; best_scores_right[feature_idx] = leaf_err_R;
-        best_child_scores_left_L[feature_idx] = -1; best_child_scores_left_R[feature_idx] = -1;
-        best_child_scores_right_L[feature_idx] = -1; best_child_scores_right_R[feature_idx] = -1;
     }
     __syncthreads();
 
     // ---------------------------------------------------------
-    // PASS 2: Find Best Split (Thread 0 Only for now)
+    // PASS 2: Parallel Scan & Split Finding
     // ---------------------------------------------------------
-    // Optimization Note: To parallelize this, we need Prefix Sums. 
-    // Given the constraints and current complexity, keeping this serial 
-    // is acceptable as long as counting (the heavy part) is parallel.
+    // Each thread initializes its running counters with 'my_starting_counts'
+    // Then scans its own chunk.
+    
+    int local_best_score_L = 99999999;
+    float local_best_thresh_L = 0.0f;
+    int local_best_lL_L=0, local_best_lR_L=0, local_best_cL_L=-1, local_best_cR_L=-1;
+
+    int local_best_score_R = 99999999;
+    float local_best_thresh_R = 0.0f;
+    int local_best_lL_R=0, local_best_lR_R=0, local_best_cL_R=-1, local_best_cR_R=-1;
+
+    // Local running counters
+    int curr_counts_L[10];
+    int curr_counts_R[10];
+    for(int c=0; c<num_classes; ++c) {
+        curr_counts_L[c] = my_starting_counts[c];
+        curr_counts_R[c] = my_starting_counts[num_classes + c];
+    }
+    
+    int curr_L_size = 0; for(int c=0; c<num_classes; ++c) curr_L_size += curr_counts_L[c];
+    int curr_R_size = 0; for(int c=0; c<num_classes; ++c) curr_R_size += curr_counts_R[c];
+    
+    int total_L_size = 0; for(int c=0; c<num_classes; ++c) total_L_size += total_counts[c];
+    int total_R_size = 0; for(int c=0; c<num_classes; ++c) total_R_size += total_counts[num_classes+c];
+
+    // Previous Value logic: If we are at start of chunk, check the global array for prev value
+    float prev_value = -999999.0f;
+    if (my_start > 0) prev_value = values[start_idx + my_start - 1];
+    else if (count > 0 && my_start == 0) prev_value = values[start_idx];
+
+    for (int i = my_start; i < my_end; ++i) {
+        int global_idx = start_idx + i;
+        float val = values[global_idx];
+        int orig_idx = original_indices[global_idx];
+        int assignment = active_mask[orig_idx];
+        int label = labels[global_idx];
+
+        bool value_changed = (val > prev_value + 1e-6f);
+        
+        // Only check split if value changed AND we are not at the absolute start
+        if (value_changed && i > 0) { 
+            float threshold = (prev_value + val) * 0.5f;
+
+            // --- LEFT Node Check ---
+            if (curr_L_size > 0 && curr_L_size < total_L_size) {
+                int l_lbl, r_lbl;
+                int score_L = calculate_misclassification(curr_counts_L, num_classes, curr_L_size, l_lbl);
+                
+                // Remainder logic
+                int max_rem = 0; int rem_lbl = 0;
+                for(int c=0; c<num_classes; ++c) {
+                    int rem = total_counts[c] - curr_counts_L[c];
+                    if(rem > max_rem) { max_rem = rem; rem_lbl = c; }
+                }
+                int score_R = (total_L_size - curr_L_size) - max_rem;
+                r_lbl = rem_lbl;
+
+                int total_score = score_L + score_R;
+                if (total_score < local_best_score_L) {
+                    local_best_score_L = total_score;
+                    local_best_thresh_L = threshold;
+                    local_best_lL_L = l_lbl; local_best_lR_L = r_lbl;
+                    local_best_cL_L = score_L; local_best_cR_L = score_R;
+                }
+            }
+            
+            // --- RIGHT Node Check ---
+            if (curr_R_size > 0 && curr_R_size < total_R_size) {
+                int l_lbl, r_lbl;
+                int score_L = calculate_misclassification(curr_counts_R, num_classes, curr_R_size, l_lbl);
+
+                int max_rem = 0; int rem_lbl = 0;
+                for(int c=0; c<num_classes; ++c) {
+                    int rem = total_counts[num_classes + c] - curr_counts_R[c];
+                    if(rem > max_rem) { max_rem = rem; rem_lbl = c; }
+                }
+                int score_R = (total_R_size - curr_R_size) - max_rem;
+                r_lbl = rem_lbl;
+
+                int total_score = score_L + score_R;
+                if (total_score < local_best_score_R) {
+                    local_best_score_R = total_score;
+                    local_best_thresh_R = threshold;
+                    local_best_lL_R = l_lbl; local_best_lR_R = r_lbl;
+                    local_best_cL_R = score_L; local_best_cR_R = score_R;
+                }
+            }
+        }
+
+        // Update Counters
+        if (assignment == 0) {
+            curr_counts_L[label]++; curr_L_size++;
+        } else if (assignment == 1) {
+            curr_counts_R[label]++; curr_R_size++;
+        }
+        prev_value = val;
+    }
+
+    // ---------------------------------------------------------
+    // REDUCTION: Find Best Split Across All Threads
+    // ---------------------------------------------------------
+    // Store local bests in shared memory to reduce
+    // Re-use shared_counts buffer (it's large enough)
+    // Structure: [tid] -> score
+    
+    // REDUCE LEFT
+    __syncthreads();
+    shared_counts[tid] = local_best_score_L;
+    __syncthreads();
+    
+    // Simple reduction by Thread 0
+    if (tid == 0) {
+        int best_score = leaf_scores_left[feature_idx]; // Start with Leaf Score
+        int best_t = -1;
+        
+        for(int t=0; t<bdim; ++t) {
+            if (shared_counts[t] < best_score) {
+                best_score = shared_counts[t];
+                best_t = t;
+            }
+        }
+        
+        best_scores_left[feature_idx] = best_score;
+        if (best_t != -1) {
+            // Wait, Thread 0 needs the details (threshold, labels) from Thread best_t
+            // We need a way to communicate that.
+            // Shared memory is limited.
+            // Let's iterate again? Or store best index in shared?
+            shared_counts[0] = best_t; // Broadcast winner
+        } else {
+            shared_counts[0] = -1;
+        }
+    }
+    __syncthreads();
+    
+    int winner_L = shared_counts[0];
+    if (winner_L != -1 && tid == winner_L) {
+        // Winner writes to global memory
+        best_thresholds_left[feature_idx] = local_best_thresh_L;
+        best_labels_left_L[feature_idx] = local_best_lL_L;
+        best_labels_left_R[feature_idx] = local_best_lR_L;
+        best_child_scores_left_L[feature_idx] = local_best_cL_L;
+        best_child_scores_left_R[feature_idx] = local_best_cR_L;
+    }
+    
+    // REDUCE RIGHT
+    __syncthreads();
+    shared_counts[tid] = local_best_score_R;
+    __syncthreads();
     
     if (tid == 0) {
-        // Reuse shared mem buffers for "Current Counts"
-        // total_counts_L/R are at indices [0..num_classes-1] and [num_classes..2*num_classes-1]
-        // We use indices [2*num_classes ... ] for curr_counts
-        int* curr_counts_L = &shared_mem[2 * num_classes];
-        int* curr_counts_R = &shared_mem[3 * num_classes];
-        
-        // Reset current counters
-        for(int c=0; c<num_classes; ++c) { curr_counts_L[c] = 0; curr_counts_R[c] = 0; }
-
-        int curr_L_size = 0;
-        int curr_R_size = 0;
-        float prev_value = -999999.0f;
-        if(count > 0) prev_value = values[start_idx];
-        
-        // Use Pre-calculated Totals
-        int total_L_size = 0; for(int c=0; c<num_classes; ++c) total_L_size += total_counts_L[c];
-        int total_R_size = 0; for(int c=0; c<num_classes; ++c) total_R_size += total_counts_R[c];
-
-        for (int i = 0; i < count; i++) {
-            int global_idx = start_idx + i;
-            float val = values[global_idx];
-            int orig_idx = original_indices[global_idx];
-            int assignment = active_mask[orig_idx];
-            int label = labels[global_idx];
-
-            bool value_changed = (val > prev_value + 1e-6f);
-            
-            if (value_changed) {
-                float threshold = (prev_value + val) * 0.5f;
-
-                // LEFT Check
-                if (curr_L_size > 0 && curr_L_size < total_L_size) {
-                    int l_lbl, r_lbl;
-                    int score_L = calculate_misclassification(curr_counts_L, num_classes, curr_L_size, l_lbl);
-                    
-                    int max_rem = 0; int rem_lbl = 0;
-                    for(int c=0; c<num_classes; ++c) {
-                        int rem = total_counts_L[c] - curr_counts_L[c];
-                        if(rem > max_rem) { max_rem = rem; rem_lbl = c; }
-                    }
-                    int score_R = (total_L_size - curr_L_size) - max_rem;
-                    r_lbl = rem_lbl;
-
-                    if ((score_L + score_R) < best_scores_left[feature_idx]) {
-                        best_scores_left[feature_idx] = score_L + score_R;
-                        best_thresholds_left[feature_idx] = threshold;
-                        best_labels_left_L[feature_idx] = l_lbl;
-                        best_labels_left_R[feature_idx] = r_lbl;
-                        best_child_scores_left_L[feature_idx] = score_L;
-                        best_child_scores_left_R[feature_idx] = score_R;
-                    }
-                }
-
-                // RIGHT Check
-                if (curr_R_size > 0 && curr_R_size < total_R_size) {
-                    int l_lbl, r_lbl;
-                    int score_L = calculate_misclassification(curr_counts_R, num_classes, curr_R_size, l_lbl);
-
-                    int max_rem = 0; int rem_lbl = 0;
-                    for(int c=0; c<num_classes; ++c) {
-                        int rem = total_counts_R[c] - curr_counts_R[c];
-                        if(rem > max_rem) { max_rem = rem; rem_lbl = c; }
-                    }
-                    int score_R = (total_R_size - curr_R_size) - max_rem;
-                    r_lbl = rem_lbl;
-
-                    if ((score_L + score_R) < best_scores_right[feature_idx]) {
-                        best_scores_right[feature_idx] = score_L + score_R;
-                        best_thresholds_right[feature_idx] = threshold;
-                        best_labels_right_L[feature_idx] = l_lbl;
-                        best_labels_right_R[feature_idx] = r_lbl;
-                        best_child_scores_right_L[feature_idx] = score_L;
-                        best_child_scores_right_R[feature_idx] = score_R;
-                    }
-                }
+        int best_score = leaf_scores_right[feature_idx];
+        int best_t = -1;
+        for(int t=0; t<bdim; ++t) {
+            if (shared_counts[t] < best_score) {
+                best_score = shared_counts[t];
+                best_t = t;
             }
-
-            if (assignment == 0) {
-                curr_counts_L[label]++; curr_L_size++;
-            } else if (assignment == 1) {
-                curr_counts_R[label]++; curr_R_size++;
-            }
-            prev_value = val;
         }
+        best_scores_right[feature_idx] = best_score;
+        shared_counts[0] = best_t;
+    }
+    __syncthreads();
+    
+    int winner_R = shared_counts[0];
+    if (winner_R != -1 && tid == winner_R) {
+        best_thresholds_right[feature_idx] = local_best_thresh_R;
+        best_labels_right_L[feature_idx] = local_best_lL_R;
+        best_labels_right_R[feature_idx] = local_best_lR_R;
+        best_child_scores_right_L[feature_idx] = local_best_cL_R;
+        best_child_scores_right_R[feature_idx] = local_best_cR_R;
     }
 }
 
@@ -256,11 +329,11 @@ void launch_specialized_solver_kernel(
     size_t int_bytes = num_feats * sizeof(int);
     size_t float_bytes = num_feats * sizeof(float);
     
-    // CALCULATE DYNAMIC SHARED MEMORY
-    // Need: [4 * num_classes] for totals + [blockDim.x * num_classes * 2] for private counters
-    // BlockDim = 256
+    // Dynamic Shared Memory Size
+    // Need: blockDim * num_classes * 2 (counters)
+    // We assume max 10 classes for the stack arrays inside kernel, but dynamic mem size needs to match.
     int block_size = 256;
-    size_t shared_mem_size = (4 * global_gpu_dataset.num_classes + block_size * global_gpu_dataset.num_classes * 2) * sizeof(int);
+    size_t shared_mem_size = (block_size * global_gpu_dataset.num_classes * 2) * sizeof(int);
 
     compute_splits_kernel<<<num_feats, block_size, shared_mem_size>>>(
         global_gpu_dataset.d_values, global_gpu_dataset.d_labels, global_gpu_dataset.d_original_indices, global_gpu_dataset.d_feature_offsets, 
