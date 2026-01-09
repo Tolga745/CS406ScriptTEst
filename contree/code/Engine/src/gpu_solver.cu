@@ -29,12 +29,11 @@ __global__ void compute_splits_kernel(
     int num_instances,
     int num_classes,
     
-    // Left Outputs
+    // Output pointers...
     int* best_scores_left, float* best_thresholds_left, int* best_labels_left_L, int* best_labels_left_R,
     int* best_child_scores_left_L, int* best_child_scores_left_R,
     int* leaf_scores_left, int* leaf_labels_left,
 
-    // Right Outputs
     int* best_scores_right, float* best_thresholds_right, int* best_labels_right_L, int* best_labels_right_R,
     int* best_child_scores_right_L, int* best_child_scores_right_R,
     int* leaf_scores_right, int* leaf_labels_right
@@ -48,54 +47,75 @@ __global__ void compute_splits_kernel(
     int* curr_counts_L  = &shared_counts[2 * num_classes];
     int* curr_counts_R  = &shared_counts[3 * num_classes];
 
+    // 1. Initialize Shared Memory in Parallel
+    for (int i = threadIdx.x; i < 4 * num_classes; i += blockDim.x) {
+        shared_counts[i] = 0;
+    }
+    __syncthreads();
+
+    int start_idx = feature_offsets[feature_idx];
+    int end_idx = feature_offsets[feature_idx + 1];
+    int count = end_idx - start_idx;
+
+    // ---------------------------------------------------------
+    // OPTIMIZED PASS 1: Parallel Counting
+    // ---------------------------------------------------------
+    // All threads process the data in a "Grid Stride" pattern
+    for (int i = threadIdx.x; i < count; i += blockDim.x) {
+        int global_idx = start_idx + i;
+        int orig_idx = original_indices[global_idx];
+        int assignment = active_mask[orig_idx]; 
+        int label = labels[global_idx];
+
+        if (assignment == 0) {
+            atomicAdd(&total_counts_L[label], 1);
+        } else if (assignment == 1) {
+            atomicAdd(&total_counts_R[label], 1);
+        }
+    }
+    __syncthreads(); // Wait for all threads to finish counting
+
+    // ---------------------------------------------------------
+    // INTERMEDIATE: Calculate Total Sizes (One thread or reduction)
+    // ---------------------------------------------------------
+    __shared__ int total_L_size;
+    __shared__ int total_R_size;
     if (threadIdx.x == 0) {
-        for(int i = 0; i < num_classes; ++i) {
-            total_counts_L[i] = 0; total_counts_R[i] = 0;
-            curr_counts_L[i] = 0;  curr_counts_R[i] = 0;
+        total_L_size = 0;
+        total_R_size = 0;
+        for(int c=0; c<num_classes; ++c) {
+            total_L_size += total_counts_L[c];
+            total_R_size += total_counts_R[c];
         }
 
-        int start_idx = feature_offsets[feature_idx];
-        int end_idx = feature_offsets[feature_idx + 1];
-        int count = end_idx - start_idx;
-
-        // --- PASS 1: Total Counts & LEAF INFO ---
-        int total_L_size = 0;
-        int total_R_size = 0;
-
-        for (int i = 0; i < count; i++) {
-            int global_idx = start_idx + i;
-            int orig_idx = original_indices[global_idx];
-            int assignment = active_mask[orig_idx]; 
-
-            if (assignment == 0) {
-                total_counts_L[labels[global_idx]]++;
-                total_L_size++;
-            } else if (assignment == 1) {
-                total_counts_R[labels[global_idx]]++;
-                total_R_size++;
-            }
-        }
-
-        // Calculate Leaf Scores/Labels (Default if we don't split)
+        // Calculate Leaf Scores (Parent Node Errors)
         int leaf_lbl_L, leaf_lbl_R;
         int leaf_err_L = calculate_misclassification(total_counts_L, num_classes, total_L_size, leaf_lbl_L);
         int leaf_err_R = calculate_misclassification(total_counts_R, num_classes, total_R_size, leaf_lbl_R);
         
+        // Write outputs
         leaf_scores_left[feature_idx] = leaf_err_L;
         leaf_labels_left[feature_idx] = leaf_lbl_L;
-        
         leaf_scores_right[feature_idx] = leaf_err_R;
         leaf_labels_right[feature_idx] = leaf_lbl_R;
 
-        // Initialize Best Scores
         best_scores_left[feature_idx] = leaf_err_L; 
         best_scores_right[feature_idx] = leaf_err_R;
         
-        // Init child scores to dummy (will be overwritten if split found, or ignored if leaf)
+        // Defaults
         best_child_scores_left_L[feature_idx] = -1; best_child_scores_left_R[feature_idx] = -1;
         best_child_scores_right_L[feature_idx] = -1; best_child_scores_right_R[feature_idx] = -1;
+    }
+    __syncthreads();
 
-        // --- PASS 2: Find Best Split ---
+    // ---------------------------------------------------------
+    // PASS 2: Find Best Split
+    // ---------------------------------------------------------
+    // NOTE: Fully parallelizing Pass 2 requires a Parallel Scan (Prefix Sum).
+    // For now, we keep this part serialized (Thread 0 only) to ensure correctness.
+    // However, since Pass 1 (memory intensive) is now parallel, it will be faster.
+    
+    if (threadIdx.x == 0) {
         int curr_L_size = 0;
         int curr_R_size = 0;
         float prev_value = -999999.0f;
@@ -131,7 +151,6 @@ __global__ void compute_splits_kernel(
                         best_thresholds_left[feature_idx] = threshold;
                         best_labels_left_L[feature_idx] = l_lbl;
                         best_labels_left_R[feature_idx] = r_lbl;
-                        // Store individual scores!
                         best_child_scores_left_L[feature_idx] = score_L;
                         best_child_scores_left_R[feature_idx] = score_R;
                     }
