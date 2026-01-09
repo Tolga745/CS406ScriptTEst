@@ -1,7 +1,9 @@
 cmake_minimum_required(VERSION 3.9)
 project(ConTree)
+project(ConTree LANGUAGES CXX CUDA)
 
 set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CUDA_STANDARD 17)
 
 find_package(OpenMP REQUIRED)
 
@@ -30,6 +32,7 @@ if (CMAKE_BUILD_TYPE STREQUAL Release)
         add_compile_options(-O3)
         add_compile_options(-march=native)
         add_compile_options(-funroll-loops)
+        set(CMAKE_CUDA_FLAGS_RELEASE "${CMAKE_CUDA_FLAGS_RELEASE} -O3")
     endif()
 
 endif()
@@ -42,6 +45,8 @@ file(GLOB SRC_FILES
     ${CMAKE_CURRENT_SOURCE_DIR}/Utilities/src/*.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/Engine/src/*.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/main.cpp
+
+    ${CMAKE_CURRENT_SOURCE_DIR}/Engine/src/gpu_solver.cu
 )
 
 # Define include directories
