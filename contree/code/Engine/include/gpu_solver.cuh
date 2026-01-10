@@ -3,6 +3,7 @@
 
 #include <vector>
 #include "dataset.h"
+#include "gpu_structs.h"
 
 struct GPUDataset {
     // Permanent Data (Read Only)
@@ -29,20 +30,13 @@ struct GPUDataset {
 extern GPUDataset global_gpu_dataset;
 
 
-void launch_specialized_solver_kernel_gpu_gen(
-    int feature_index,
-    float threshold,
-    int upper_bound,
-    int* h_best_scores_left, float* h_best_thresholds_left, int* h_best_labels_left_L, int* h_best_labels_left_R, int* h_best_child_scores_left_L, int* h_best_child_scores_left_R, int* h_leaf_scores_left, int* h_leaf_labels_left,
-    int* h_best_scores_right, float* h_best_thresholds_right, int* h_best_labels_right_L, int* h_best_labels_right_R, int* h_best_child_scores_right_L, int* h_best_child_scores_right_R, int* h_leaf_scores_right, int* h_leaf_labels_right
-);
-
-void launch_specialized_solver_kernel(
-    const std::vector<int>& active_indices,
-    const std::vector<int>& split_assignment,
+void run_specialized_solver_gpu(
+    const GPUDataview& dataview,
+    int split_feature_index,
+    float split_threshold,
     int upper_bound,
     
-    // (Output pointers remain the same)
+    // Output pointers (Host pointers where results will be copied)
     int* h_best_scores_left, float* h_best_thresholds_left, int* h_best_labels_left_L, int* h_best_labels_left_R, int* h_best_child_scores_left_L, int* h_best_child_scores_left_R, int* h_leaf_scores_left, int* h_leaf_labels_left,
     int* h_best_scores_right, float* h_best_thresholds_right, int* h_best_labels_right_L, int* h_best_labels_right_R, int* h_best_child_scores_right_L, int* h_best_child_scores_right_R, int* h_leaf_scores_right, int* h_leaf_labels_right
 );
