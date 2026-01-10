@@ -87,7 +87,7 @@ private:
 
     const bool sort_by_gini_index;
 
-    static void initialize_split_parameters(const std::vector<Dataset::FeatureElement>& current_feature, int class_number, const std::vector<int> &current_label_frequency, int split_point, std::vector<int> &left_label_frequency, std::vector<int> &right_label_frequency);
+    
     
 };
 
