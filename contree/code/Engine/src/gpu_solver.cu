@@ -4,17 +4,18 @@
 #include <limits>
 #include <vector>
 #include <cassert>
+#include <omp.h>
 
 // --- CONFIGURATION ---
-// Support up to 32 classes (32 * 2 counters = 64 integers per thread)
-// If you have a dataset with >32 classes, increase this number.
 #define MAX_CLASSES 32 
 #define MAX_COUNTERS (MAX_CLASSES * 2)
+#define NUM_STREAMS 32 // Pool size for streams
 
 GPUDataset global_gpu_dataset;
-
-// Global Pinned Memory Pointer
 int* g_pinned_assignment_buffer = nullptr;
+
+// Pool of CUDA Streams
+cudaStream_t g_streams[NUM_STREAMS];
 
 __device__ int calculate_misclassification(int* counts, int num_classes, int total_count, int& best_label_out) {
     int max_freq = 0;
@@ -50,7 +51,6 @@ __global__ void compute_splits_kernel(
     int feature_idx = blockIdx.x;
     if (feature_idx >= num_features) return;
 
-    // Shared Memory: Stores counters for every thread
     extern __shared__ int shared_counts[];
     
     int tid = threadIdx.x;
@@ -66,9 +66,6 @@ __global__ void compute_splits_kernel(
 
     int num_counters_per_thread = num_classes * 2;
     
-    // Safety check (only needs to be checked once, usually done on host, but good for debug)
-    // if (num_counters_per_thread > MAX_COUNTERS) return; 
-
     // 1. Initialize Shared Memory
     for (int i = 0; i < num_counters_per_thread; ++i) {
         shared_counts[tid * num_counters_per_thread + i] = 0;
@@ -85,23 +82,20 @@ __global__ void compute_splits_kernel(
         int label = labels[global_idx];
 
         if (assignment == 0) {
-            shared_counts[tid * num_counters_per_thread + label]++; // Left
+            shared_counts[tid * num_counters_per_thread + label]++; 
         } else if (assignment == 1) {
-            shared_counts[tid * num_counters_per_thread + num_classes + label]++; // Right
+            shared_counts[tid * num_counters_per_thread + num_classes + label]++; 
         }
     }
     __syncthreads();
 
     // ---------------------------------------------------------
-    // OPTIMIZATION: Parallel Prefix Sum (Hillis-Steele Scan)
+    // Parallel Prefix Sum (Hillis-Steele)
     // ---------------------------------------------------------
-    // We use a register array 'neighbor_vals' to avoid Read-After-Write hazards.
-    
     for (int offset = 1; offset < bdim; offset *= 2) {
-        int neighbor_vals[MAX_COUNTERS]; // FIXED: Increased size
+        int neighbor_vals[MAX_COUNTERS]; 
         bool has_neighbor = (tid >= offset);
         
-        // Read neighbor values
         if (has_neighbor) {
             for (int c = 0; c < num_counters_per_thread; ++c) {
                 neighbor_vals[c] = shared_counts[(tid - offset) * num_counters_per_thread + c];
@@ -109,7 +103,6 @@ __global__ void compute_splits_kernel(
         }
         __syncthreads(); 
 
-        // Add neighbor values
         if (has_neighbor) {
             for (int c = 0; c < num_counters_per_thread; ++c) {
                 shared_counts[tid * num_counters_per_thread + c] += neighbor_vals[c];
@@ -118,8 +111,7 @@ __global__ void compute_splits_kernel(
         __syncthreads();
     }
 
-    // Recover Exclusive Sum for "Starting Counts"
-    int my_starting_counts[MAX_COUNTERS]; // FIXED: Increased size
+    int my_starting_counts[MAX_COUNTERS]; 
     if (tid > 0) {
         for (int c = 0; c < num_counters_per_thread; ++c) {
             my_starting_counts[c] = shared_counts[(tid - 1) * num_counters_per_thread + c];
@@ -128,8 +120,7 @@ __global__ void compute_splits_kernel(
         for(int c = 0; c < num_counters_per_thread; ++c) my_starting_counts[c] = 0;
     }
     
-    // Calculate TOTALS (The last thread holds the sum of everyone)
-    __shared__ int total_counts[MAX_COUNTERS]; // FIXED: Increased size
+    __shared__ int total_counts[MAX_COUNTERS]; 
     if (tid == bdim - 1) {
         for (int c = 0; c < num_counters_per_thread; ++c) {
             total_counts[c] = shared_counts[tid * num_counters_per_thread + c];
@@ -138,7 +129,7 @@ __global__ void compute_splits_kernel(
     __syncthreads();
 
     // ---------------------------------------------------------
-    // CALCULATE LEAF SCORES (Thread 0)
+    // Leaf Scores
     // ---------------------------------------------------------
     if (tid == 0) {
         int total_L_size = 0;
@@ -160,7 +151,6 @@ __global__ void compute_splits_kernel(
     // ---------------------------------------------------------
     // PASS 2: Split Finding
     // ---------------------------------------------------------
-    
     int local_best_score_L = 99999999;
     float local_best_thresh_L = 0.0f;
     int local_best_lL_L=0, local_best_lR_L=0, local_best_cL_L=-1, local_best_cR_L=-1;
@@ -169,9 +159,8 @@ __global__ void compute_splits_kernel(
     float local_best_thresh_R = 0.0f;
     int local_best_lL_R=0, local_best_lR_R=0, local_best_cL_R=-1, local_best_cR_R=-1;
 
-    // Local running counters
-    int curr_counts_L[MAX_CLASSES]; // FIXED
-    int curr_counts_R[MAX_CLASSES]; // FIXED
+    int curr_counts_L[MAX_CLASSES]; 
+    int curr_counts_R[MAX_CLASSES]; 
     for(int c=0; c<num_classes; ++c) {
         curr_counts_L[c] = my_starting_counts[c];
         curr_counts_R[c] = my_starting_counts[num_classes + c];
@@ -179,7 +168,6 @@ __global__ void compute_splits_kernel(
     
     int curr_L_size = 0; for(int c=0; c<num_classes; ++c) curr_L_size += curr_counts_L[c];
     int curr_R_size = 0; for(int c=0; c<num_classes; ++c) curr_R_size += curr_counts_R[c];
-    
     int total_L_size = 0; for(int c=0; c<num_classes; ++c) total_L_size += total_counts[c];
     int total_R_size = 0; for(int c=0; c<num_classes; ++c) total_R_size += total_counts[num_classes+c];
 
@@ -199,11 +187,9 @@ __global__ void compute_splits_kernel(
         if (value_changed && i > 0) { 
             float threshold = (prev_value + val) * 0.5f;
 
-            // --- LEFT Node Check ---
             if (curr_L_size > 0 && curr_L_size < total_L_size) {
                 int l_lbl, r_lbl;
                 int score_L = calculate_misclassification(curr_counts_L, num_classes, curr_L_size, l_lbl);
-                
                 int max_rem = 0; int rem_lbl = 0;
                 for(int c=0; c<num_classes; ++c) {
                     int rem = total_counts[c] - curr_counts_L[c];
@@ -211,21 +197,15 @@ __global__ void compute_splits_kernel(
                 }
                 int score_R = (total_L_size - curr_L_size) - max_rem;
                 r_lbl = rem_lbl;
-
                 int total_score = score_L + score_R;
                 if (total_score < local_best_score_L) {
-                    local_best_score_L = total_score;
-                    local_best_thresh_L = threshold;
-                    local_best_lL_L = l_lbl; local_best_lR_L = r_lbl;
-                    local_best_cL_L = score_L; local_best_cR_L = score_R;
+                    local_best_score_L = total_score; local_best_thresh_L = threshold;
+                    local_best_lL_L = l_lbl; local_best_lR_L = r_lbl; local_best_cL_L = score_L; local_best_cR_L = score_R;
                 }
             }
-            
-            // --- RIGHT Node Check ---
             if (curr_R_size > 0 && curr_R_size < total_R_size) {
                 int l_lbl, r_lbl;
                 int score_L = calculate_misclassification(curr_counts_R, num_classes, curr_R_size, l_lbl);
-
                 int max_rem = 0; int rem_lbl = 0;
                 for(int c=0; c<num_classes; ++c) {
                     int rem = total_counts[num_classes + c] - curr_counts_R[c];
@@ -233,23 +213,15 @@ __global__ void compute_splits_kernel(
                 }
                 int score_R = (total_R_size - curr_R_size) - max_rem;
                 r_lbl = rem_lbl;
-
                 int total_score = score_L + score_R;
                 if (total_score < local_best_score_R) {
-                    local_best_score_R = total_score;
-                    local_best_thresh_R = threshold;
-                    local_best_lL_R = l_lbl; local_best_lR_R = r_lbl;
-                    local_best_cL_R = score_L; local_best_cR_R = score_R;
+                    local_best_score_R = total_score; local_best_thresh_R = threshold;
+                    local_best_lL_R = l_lbl; local_best_lR_R = r_lbl; local_best_cL_R = score_L; local_best_cR_R = score_R;
                 }
             }
         }
-
-        // Update Counters
-        if (assignment == 0) {
-            curr_counts_L[label]++; curr_L_size++;
-        } else if (assignment == 1) {
-            curr_counts_R[label]++; curr_R_size++;
-        }
+        if (assignment == 0) { curr_counts_L[label]++; curr_L_size++; } 
+        else if (assignment == 1) { curr_counts_R[label]++; curr_R_size++; }
         prev_value = val;
     }
 
@@ -261,21 +233,16 @@ __global__ void compute_splits_kernel(
     __syncthreads();
     shared_counts[tid] = local_best_score_L;
     __syncthreads();
-    
     if (tid == 0) {
         int best_score = leaf_scores_left[feature_idx];
         int best_t = -1;
         for(int t=0; t<bdim; ++t) {
-            if (shared_counts[t] < best_score) {
-                best_score = shared_counts[t];
-                best_t = t;
-            }
+            if (shared_counts[t] < best_score) { best_score = shared_counts[t]; best_t = t; }
         }
         best_scores_left[feature_idx] = best_score;
         shared_counts[0] = (best_t != -1) ? best_t : -1;
     }
     __syncthreads();
-    
     int winner_L = shared_counts[0];
     if (winner_L != -1 && tid == winner_L) {
         best_thresholds_left[feature_idx] = local_best_thresh_L;
@@ -289,21 +256,16 @@ __global__ void compute_splits_kernel(
     __syncthreads();
     shared_counts[tid] = local_best_score_R;
     __syncthreads();
-    
     if (tid == 0) {
         int best_score = leaf_scores_right[feature_idx];
         int best_t = -1;
         for(int t=0; t<bdim; ++t) {
-            if (shared_counts[t] < best_score) {
-                best_score = shared_counts[t];
-                best_t = t;
-            }
+            if (shared_counts[t] < best_score) { best_score = shared_counts[t]; best_t = t; }
         }
         best_scores_right[feature_idx] = best_score;
         shared_counts[0] = best_t;
     }
     __syncthreads();
-    
     int winner_R = shared_counts[0];
     if (winner_R != -1 && tid == winner_R) {
         best_thresholds_right[feature_idx] = local_best_thresh_R;
@@ -328,57 +290,69 @@ void launch_specialized_solver_kernel(
         exit(1);
     }
 
-    // Write directly to Pinned Memory
-    for(size_t i=0; i<active_indices.size(); ++i) {
-        g_pinned_assignment_buffer[active_indices[i]] = split_assignment[i];
-    }
+    // ---------------------------------------------------------
+    // NEW: Hybrid Parallelism with CUDA Streams
+    // ---------------------------------------------------------
+    // 1. Get thread ID from OpenMP (assumes openmp is used in general_solver)
+    int thread_id = 0;
+    #ifdef _OPENMP
+        thread_id = omp_get_thread_num();
+    #endif
     
-    cudaMemset(global_gpu_dataset.d_assignment_buffer, -1, global_gpu_dataset.num_instances * sizeof(int));
-    cudaMemcpy(global_gpu_dataset.d_assignment_buffer, g_pinned_assignment_buffer, global_gpu_dataset.num_instances * sizeof(int), cudaMemcpyHostToDevice);
+    // 2. Select stream from pool to avoid blocking other threads
+    cudaStream_t stream = g_streams[thread_id % NUM_STREAMS];
 
+    
+    cudaMemcpyAsync(global_gpu_dataset.d_assignment_buffer, split_assignment.data(), 
+                    split_assignment.size() * sizeof(int), cudaMemcpyHostToDevice, stream);
+
+    
     int num_feats = global_gpu_dataset.num_features;
     size_t int_bytes = num_feats * sizeof(int);
     size_t float_bytes = num_feats * sizeof(float);
-    
     int block_size = 256;
     size_t shared_mem_size = (block_size * global_gpu_dataset.num_classes * 2) * sizeof(int);
 
-    compute_splits_kernel<<<num_feats, block_size, shared_mem_size>>>(
+    compute_splits_kernel<<<num_feats, block_size, shared_mem_size, stream>>>(
         global_gpu_dataset.d_values, global_gpu_dataset.d_labels, global_gpu_dataset.d_original_indices, global_gpu_dataset.d_feature_offsets, 
         global_gpu_dataset.d_assignment_buffer,
         num_feats, global_gpu_dataset.num_instances, global_gpu_dataset.num_classes,
-        
-        global_gpu_dataset.d_score_L, global_gpu_dataset.d_thresh_L, global_gpu_dataset.d_lbl_L_L, global_gpu_dataset.d_lbl_L_R, 
-        global_gpu_dataset.d_cscore_L_L, global_gpu_dataset.d_cscore_L_R, global_gpu_dataset.d_leaf_L, global_gpu_dataset.d_leaflbl_L,
-
-        global_gpu_dataset.d_score_R, global_gpu_dataset.d_thresh_R, global_gpu_dataset.d_lbl_R_L, global_gpu_dataset.d_lbl_R_R, 
-        global_gpu_dataset.d_cscore_R_L, global_gpu_dataset.d_cscore_R_R, global_gpu_dataset.d_leaf_R, global_gpu_dataset.d_leaflbl_R
+        global_gpu_dataset.d_score_L, global_gpu_dataset.d_thresh_L, global_gpu_dataset.d_lbl_L_L, global_gpu_dataset.d_lbl_L_R, global_gpu_dataset.d_cscore_L_L, global_gpu_dataset.d_cscore_L_R, global_gpu_dataset.d_leaf_L, global_gpu_dataset.d_leaflbl_L,
+        global_gpu_dataset.d_score_R, global_gpu_dataset.d_thresh_R, global_gpu_dataset.d_lbl_R_L, global_gpu_dataset.d_lbl_R_R, global_gpu_dataset.d_cscore_R_L, global_gpu_dataset.d_cscore_R_R, global_gpu_dataset.d_leaf_R, global_gpu_dataset.d_leaflbl_R
     );
-    cudaDeviceSynchronize();
 
-    cudaMemcpy(h_best_scores_left, global_gpu_dataset.d_score_L, int_bytes, cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_best_thresholds_left, global_gpu_dataset.d_thresh_L, float_bytes, cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_best_labels_left_L, global_gpu_dataset.d_lbl_L_L, int_bytes, cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_best_labels_left_R, global_gpu_dataset.d_lbl_L_R, int_bytes, cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_best_child_scores_left_L, global_gpu_dataset.d_cscore_L_L, int_bytes, cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_best_child_scores_left_R, global_gpu_dataset.d_cscore_L_R, int_bytes, cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_leaf_scores_left, global_gpu_dataset.d_leaf_L, int_bytes, cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_leaf_labels_left, global_gpu_dataset.d_leaflbl_L, int_bytes, cudaMemcpyDeviceToHost);
+    // Retrieve results Async
+    cudaMemcpyAsync(h_best_scores_left, global_gpu_dataset.d_score_L, int_bytes, cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(h_best_thresholds_left, global_gpu_dataset.d_thresh_L, float_bytes, cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(h_best_labels_left_L, global_gpu_dataset.d_lbl_L_L, int_bytes, cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(h_best_labels_left_R, global_gpu_dataset.d_lbl_L_R, int_bytes, cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(h_best_child_scores_left_L, global_gpu_dataset.d_cscore_L_L, int_bytes, cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(h_best_child_scores_left_R, global_gpu_dataset.d_cscore_L_R, int_bytes, cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(h_leaf_scores_left, global_gpu_dataset.d_leaf_L, int_bytes, cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(h_leaf_labels_left, global_gpu_dataset.d_leaflbl_L, int_bytes, cudaMemcpyDeviceToHost, stream);
 
-    cudaMemcpy(h_best_scores_right, global_gpu_dataset.d_score_R, int_bytes, cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_best_thresholds_right, global_gpu_dataset.d_thresh_R, float_bytes, cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_best_labels_right_L, global_gpu_dataset.d_lbl_R_L, int_bytes, cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_best_labels_right_R, global_gpu_dataset.d_lbl_R_R, int_bytes, cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_best_child_scores_right_L, global_gpu_dataset.d_cscore_R_L, int_bytes, cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_best_child_scores_right_R, global_gpu_dataset.d_cscore_R_R, int_bytes, cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_leaf_scores_right, global_gpu_dataset.d_leaf_R, int_bytes, cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_leaf_labels_right, global_gpu_dataset.d_leaflbl_R, int_bytes, cudaMemcpyDeviceToHost);
+    cudaMemcpyAsync(h_best_scores_right, global_gpu_dataset.d_score_R, int_bytes, cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(h_best_thresholds_right, global_gpu_dataset.d_thresh_R, float_bytes, cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(h_best_labels_right_L, global_gpu_dataset.d_lbl_R_L, int_bytes, cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(h_best_labels_right_R, global_gpu_dataset.d_lbl_R_R, int_bytes, cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(h_best_child_scores_right_L, global_gpu_dataset.d_cscore_R_L, int_bytes, cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(h_best_child_scores_right_R, global_gpu_dataset.d_cscore_R_R, int_bytes, cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(h_leaf_scores_right, global_gpu_dataset.d_leaf_R, int_bytes, cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(h_leaf_labels_right, global_gpu_dataset.d_leaflbl_R, int_bytes, cudaMemcpyDeviceToHost, stream);
+
+    // Sync ONLY this stream
+    cudaStreamSynchronize(stream);
 }
 
 void GPUDataset::initialize(const Dataset& cpu_dataset) {
     num_features = cpu_dataset.get_features_size();
     num_instances = cpu_dataset.get_instance_number();
     
+    // Initialize Stream Pool
+    for(int i=0; i<NUM_STREAMS; ++i) {
+        cudaStreamCreate(&g_streams[i]);
+    }
+
     // Flatten Data
     int max_label = 0;
     std::vector<float> h_vals;
@@ -411,13 +385,10 @@ void GPUDataset::initialize(const Dataset& cpu_dataset) {
     cudaMemcpy(d_original_indices, h_indices.data(), h_indices.size() * sizeof(int), cudaMemcpyHostToDevice);
     cudaMemcpy(d_feature_offsets, h_offsets.data(), h_offsets.size() * sizeof(int), cudaMemcpyHostToDevice);
 
-    // --- NEW: Allocate Workspace ---
     size_t int_bytes = num_features * sizeof(int);
     size_t float_bytes = num_features * sizeof(float);
 
     cudaMalloc(&d_assignment_buffer, num_instances * sizeof(int));
-    
-    // OPTIMIZATION: Allocate Pinned Memory for Host Buffer
     cudaMallocHost(&g_pinned_assignment_buffer, num_instances * sizeof(int));
 
     cudaMalloc(&d_score_L, int_bytes); cudaMalloc(&d_thresh_L, float_bytes);
@@ -433,11 +404,14 @@ void GPUDataset::initialize(const Dataset& cpu_dataset) {
 
 void GPUDataset::free() {
     cudaFree(d_values); cudaFree(d_labels); cudaFree(d_original_indices); cudaFree(d_feature_offsets);
-    
-    // Free workspace
     cudaFree(d_assignment_buffer);
     if (g_pinned_assignment_buffer) cudaFreeHost(g_pinned_assignment_buffer);
     
     cudaFree(d_score_L); cudaFree(d_thresh_L); cudaFree(d_lbl_L_L); cudaFree(d_lbl_L_R); cudaFree(d_cscore_L_L); cudaFree(d_cscore_L_R); cudaFree(d_leaf_L); cudaFree(d_leaflbl_L);
     cudaFree(d_score_R); cudaFree(d_thresh_R); cudaFree(d_lbl_R_L); cudaFree(d_lbl_R_R); cudaFree(d_cscore_R_L); cudaFree(d_cscore_R_R); cudaFree(d_leaf_R); cudaFree(d_leaflbl_R);
+
+    // Destroy Streams
+    for(int i=0; i<NUM_STREAMS; ++i) {
+        cudaStreamDestroy(g_streams[i]);
+    }
 }
