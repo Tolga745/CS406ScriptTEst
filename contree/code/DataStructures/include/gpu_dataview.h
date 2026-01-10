@@ -17,4 +17,9 @@ void split_gpu_dataview(const GPUDataview& parent, GPUDataview& left, GPUDatavie
 
 void split_gpu_dataview_preallocated(const GPUDataview& parent, GPUDataview& left, GPUDataview& right, int split_feat_idx, float threshold, int* d_row_map_buffer, cudaStream_t stream = 0);
 
+void allocate_scratch_gpu_view(GPUDataview& view, int num_instances, int num_features);
+void free_scratch_gpu_view(GPUDataview& view);
+void allocate_int_buffer(int** buffer, size_t count);
+void free_int_buffer(int* buffer);
+
 #endif

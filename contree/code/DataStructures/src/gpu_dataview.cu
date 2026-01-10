@@ -79,15 +79,7 @@ void split_gpu_dataview(const GPUDataview& parent, GPUDataview& left, GPUDatavie
     right.owns_memory = true;
     
     // 2. Allocate Temporary Map
-    // Map size must cover the maximum possible row index. 
-    // Since we use d_original_indices which are 0..TotalDatasetSize-1, we need TotalDatasetSize.
-    // However, we might not know TotalDatasetSize here easily without querying.
-    // Hack: Use a large enough buffer or pass global size. 
-    // For safety, let's assume we can get it from max element or passed in. 
-    // Optimization: Just use parent.num_instances if we re-indexed, but we didn't.
-    // Let's rely on the fact that row indices are < 10,000,000 usually. 
-    // A better way is to pass Global Dataset Size to this function.
-    // For this context, we'll allocate 10M integers (approx 40MB), which is safe for most datasets.
+    
     int max_rows = 10000000; 
     int* d_row_map;
     cudaMalloc(&d_row_map, max_rows * sizeof(int));
@@ -146,4 +138,33 @@ void split_gpu_dataview_preallocated(const GPUDataview& parent, GPUDataview& lef
     for (int f = 0; f < parent.num_features; f++) {
         partition_column(parent, left, right, f, d_row_map_buffer, stream);
     }
+}
+
+void allocate_scratch_gpu_view(GPUDataview& view, int num_instances, int num_features) {
+    view.num_features = num_features;
+    view.num_instances = num_instances;
+    size_t elem_count = (size_t)num_instances * num_features;
+    
+    cudaMalloc(&view.d_values, elem_count * sizeof(float));
+    cudaMalloc(&view.d_labels, elem_count * sizeof(int));
+    cudaMalloc(&view.d_row_indices, elem_count * sizeof(int));
+    
+    view.owns_memory = true;
+}
+
+void free_scratch_gpu_view(GPUDataview& view) {
+    if (view.d_values) cudaFree(view.d_values);
+    if (view.d_labels) cudaFree(view.d_labels);
+    if (view.d_row_indices) cudaFree(view.d_row_indices);
+    view.d_values = nullptr;
+    view.d_labels = nullptr;
+    view.d_row_indices = nullptr;
+}
+
+void allocate_int_buffer(int** buffer, size_t count) {
+    cudaMalloc((void**)buffer, count * sizeof(int));
+}
+
+void free_int_buffer(int* buffer) {
+    if (buffer) cudaFree(buffer);
 }

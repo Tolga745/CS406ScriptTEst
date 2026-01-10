@@ -1,24 +1,5 @@
 #include "general_solver.h"
- 
-// Helper to allocate scratch buffers
-void allocate_scratch_gpu_view(GPUDataview& view, int num_instances, int num_features) {
-    view.num_features = num_features;
-    view.num_instances = num_instances; // Capacity matches the parent size (upper bound)
-    size_t elem_count = (size_t)num_instances * num_features;
-    
-    cudaMalloc((void**)&view.d_values, elem_count * sizeof(float));
-    cudaMalloc((void**)&view.d_labels, elem_count * sizeof(int));
-    cudaMalloc((void**)&view.d_row_indices, elem_count * sizeof(int));
-    
-    view.owns_memory = true; // Temporary owner, will be freed by free_scratch_gpu_view
-}
-
-void free_scratch_gpu_view(GPUDataview& view) {
-    if (view.d_values) cudaFree(view.d_values);
-    if (view.d_labels) cudaFree(view.d_labels);
-    if (view.d_row_indices) cudaFree(view.d_row_indices);
-    view.d_values = nullptr;
-}
+#include "gpu_dataview.h" // Include for wrapper functions
 
 void GeneralSolver::create_optimal_decision_tree(const Dataview& dataview, const Configuration& solution_configuration, std::shared_ptr<Tree>& current_optimal_decision_tree, int upper_bound) {
     if (current_optimal_decision_tree->misclassification_score == 0 || dataview.get_dataset_size() == 0) {
@@ -71,15 +52,15 @@ void GeneralSolver::create_optimal_decision_tree(const Dataview& dataview, const
     unsearched_intervals.push({0, (int)possible_split_indices.size() - 1, -1, -1});
 
     // --- GPU MEMORY OPTIMIZATION ---
-    // Allocate scratch buffers ONCE here instead of inside the loop (O(1) vs O(N))
     GPUDataview scratch_left, scratch_right;
     int* d_map_buffer = nullptr;
     bool using_gpu = (dataview.gpu_view.d_values != nullptr);
 
     if (using_gpu) {
+        // Use wrappers defined in gpu_dataview.h/.cu
         allocate_scratch_gpu_view(scratch_left, dataview.get_dataset_size(), dataview.get_feature_number());
         allocate_scratch_gpu_view(scratch_right, dataview.get_dataset_size(), dataview.get_feature_number());
-        cudaMalloc((void**)&d_map_buffer, 10000000 * sizeof(int)); // Safe large buffer for indices
+        allocate_int_buffer(&d_map_buffer, 10000000); 
     }
 
     while(!unsearched_intervals.empty()) {
@@ -147,7 +128,7 @@ void GeneralSolver::create_optimal_decision_tree(const Dataview& dataview, const
                 if (current_best_score == 0) {
                     // CLEANUP BEFORE RETURN
                     if (using_gpu) {
-                        if (d_map_buffer) cudaFree(d_map_buffer);
+                        free_int_buffer(d_map_buffer);
                         free_scratch_gpu_view(scratch_left);
                         free_scratch_gpu_view(scratch_right);
                     }
@@ -184,7 +165,7 @@ void GeneralSolver::create_optimal_decision_tree(const Dataview& dataview, const
 
     // FINAL CLEANUP
     if (using_gpu) {
-        if (d_map_buffer) cudaFree(d_map_buffer);
+        free_int_buffer(d_map_buffer);
         free_scratch_gpu_view(scratch_left);
         free_scratch_gpu_view(scratch_right);
     }
