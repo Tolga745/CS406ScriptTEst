@@ -1,6 +1,5 @@
 #include "general_solver.h"
-#include <cuda_runtime.h> // Required for cudaMalloc/cudaFree
-
+ 
 // Helper to allocate scratch buffers
 void allocate_scratch_gpu_view(GPUDataview& view, int num_instances, int num_features) {
     view.num_features = num_features;
