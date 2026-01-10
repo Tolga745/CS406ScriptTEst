@@ -67,7 +67,7 @@ void split_gpu_dataview(const GPUDataview& parent, GPUDataview& left, GPUDatavie
     
     mark_split_indices_kernel<<<gridSize, blockSize, 0, stream>>>(
         parent.d_values + offset,
-        parent.d_original_indices + offset,
+        parent.d_row_indices + offset,
         d_row_map,
         parent.num_instances,
         threshold
@@ -99,19 +99,19 @@ void split_gpu_dataview(const GPUDataview& parent, GPUDataview& left, GPUDatavie
         auto zip_in = thrust::make_zip_iterator(thrust::make_tuple(
             thrust::device_pointer_cast(parent.d_values + p_offset),
             thrust::device_pointer_cast(parent.d_labels + p_offset),
-            thrust::device_pointer_cast(parent.d_original_indices + p_offset)
+            thrust::device_pointer_cast(parent.d_row_indices + p_offset)
         ));
 
         auto zip_out_left = thrust::make_zip_iterator(thrust::make_tuple(
             thrust::device_pointer_cast(left.d_values + l_offset),
             thrust::device_pointer_cast(left.d_labels + l_offset),
-            thrust::device_pointer_cast(left.d_original_indices + l_offset)
+            thrust::device_pointer_cast(left.d_row_indices + l_offset)
         ));
         
         auto zip_out_right = thrust::make_zip_iterator(thrust::make_tuple(
             thrust::device_pointer_cast(right.d_values + r_offset),
             thrust::device_pointer_cast(right.d_labels + r_offset),
-            thrust::device_pointer_cast(right.d_original_indices + r_offset)
+            thrust::device_pointer_cast(right.d_row_indices + r_offset)
         ));
 
         thrust::stable_partition_copy(
