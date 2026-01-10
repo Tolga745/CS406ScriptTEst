@@ -38,6 +38,38 @@ __global__ void mark_split_indices_kernel(
     }
 }
 
+void partition_column(const GPUDataview& parent, GPUDataview& left, GPUDataview& right, int feature_idx, int* d_row_map, cudaStream_t stream) {
+    size_t p_offset = (size_t)feature_idx * parent.num_instances;
+    size_t l_offset = (size_t)feature_idx * left.num_instances;
+    size_t r_offset = (size_t)feature_idx * right.num_instances;
+
+    auto zip_in = thrust::make_zip_iterator(thrust::make_tuple(
+        thrust::device_pointer_cast(parent.d_values + p_offset),
+        thrust::device_pointer_cast(parent.d_labels + p_offset),
+        thrust::device_pointer_cast(parent.d_row_indices + p_offset)
+    ));
+
+    auto zip_out_left = thrust::make_zip_iterator(thrust::make_tuple(
+        thrust::device_pointer_cast(left.d_values + l_offset),
+        thrust::device_pointer_cast(left.d_labels + l_offset),
+        thrust::device_pointer_cast(left.d_row_indices + l_offset)
+    ));
+    
+    auto zip_out_right = thrust::make_zip_iterator(thrust::make_tuple(
+        thrust::device_pointer_cast(right.d_values + r_offset),
+        thrust::device_pointer_cast(right.d_labels + r_offset),
+        thrust::device_pointer_cast(right.d_row_indices + r_offset)
+    ));
+
+    thrust::stable_partition_copy(
+        thrust::cuda::par.on(stream),
+        zip_in, zip_in + parent.num_instances,
+        zip_out_left,
+        zip_out_right,
+        RowSidePredicate(d_row_map)
+    );
+}
+
 void split_gpu_dataview(const GPUDataview& parent, GPUDataview& left, GPUDataview& right, int split_feat_idx, float threshold, cudaStream_t stream) {
     // 1. Setup metadata
     left.num_features = parent.num_features; left.num_classes = parent.num_classes;
@@ -92,36 +124,26 @@ void split_gpu_dataview(const GPUDataview& parent, GPUDataview& left, GPUDatavie
 
     // 5. Partition Data
     for (int f = 0; f < parent.num_features; f++) {
-        size_t p_offset = (size_t)f * parent.num_instances;
-        size_t l_offset = (size_t)f * left.num_instances;
-        size_t r_offset = (size_t)f * right.num_instances;
-
-        auto zip_in = thrust::make_zip_iterator(thrust::make_tuple(
-            thrust::device_pointer_cast(parent.d_values + p_offset),
-            thrust::device_pointer_cast(parent.d_labels + p_offset),
-            thrust::device_pointer_cast(parent.d_row_indices + p_offset)
-        ));
-
-        auto zip_out_left = thrust::make_zip_iterator(thrust::make_tuple(
-            thrust::device_pointer_cast(left.d_values + l_offset),
-            thrust::device_pointer_cast(left.d_labels + l_offset),
-            thrust::device_pointer_cast(left.d_row_indices + l_offset)
-        ));
-        
-        auto zip_out_right = thrust::make_zip_iterator(thrust::make_tuple(
-            thrust::device_pointer_cast(right.d_values + r_offset),
-            thrust::device_pointer_cast(right.d_labels + r_offset),
-            thrust::device_pointer_cast(right.d_row_indices + r_offset)
-        ));
-
-        thrust::stable_partition_copy(
-            thrust::cuda::par.on(stream),
-            zip_in, zip_in + parent.num_instances,
-            zip_out_left,
-            zip_out_right,
-            RowSidePredicate(d_row_map)
-        );
+        partition_column(parent, left, right, f, d_row_map, stream);
     }
 
     cudaFree(d_row_map);
+}
+
+void split_gpu_dataview_preallocated(const GPUDataview& parent, GPUDataview& left, GPUDataview& right, int split_feat_idx, float threshold, int* d_row_map_buffer, cudaStream_t stream) {
+    // Assumes left.d_values, right.d_values etc are already pointing to valid memory 
+    // AND left.num_instances/right.num_instances are set.
+    
+    // 1. Mark split
+    int offset = split_feat_idx * parent.num_instances;
+    int blockSize = 256;
+    int gridSize = (parent.num_instances + blockSize - 1) / blockSize;
+    mark_split_indices_kernel<<<gridSize, blockSize, 0, stream>>>(
+        parent.d_values + offset, parent.d_row_indices + offset, d_row_map_buffer, parent.num_instances, threshold
+    );
+
+    // 2. Partition
+    for (int f = 0; f < parent.num_features; f++) {
+        partition_column(parent, left, right, f, d_row_map_buffer, stream);
+    }
 }

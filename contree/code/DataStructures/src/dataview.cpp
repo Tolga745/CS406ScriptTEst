@@ -133,6 +133,11 @@ Dataview::Dataview(Dataset* sorted_dataset, Dataset* unsorted_dataset, int class
     }
 }
 
+Dataview::Dataview(int class_number, const bool sort_by_gini_index) 
+    : class_number(class_number), sort_by_gini_index(sort_by_gini_index) {
+    // Empty constructor for children
+}
+
 int Dataview::get_dataset_size() const {
     return int(feature_data[0].size());
 }
@@ -161,7 +166,7 @@ const std::vector<int>& Dataview::get_possible_split_indices(int feature_index) 
     return possible_split_indices[feature_index];
 }
 
-void Dataview::split_data_points(const Dataview& current_dataview, int feature_index, int split_point, int split_unique_value_index, Dataview& left_dataview, Dataview& right_dataview, int current_max_depth) {
+void Dataview::split_data_points(const Dataview& current_dataview, int feature_index, int split_point, int split_unique_value_index, Dataview& left_dataview, Dataview& right_dataview, int current_max_depth, GPUDataview* reuse_left_gpu, GPUDataview* reuse_right_gpu, int* d_map_buffer) {
     left_dataview.feature_data.resize(current_dataview.get_feature_number());
     right_dataview.feature_data.resize(current_dataview.get_feature_number());
 
@@ -180,10 +185,6 @@ void Dataview::split_data_points(const Dataview& current_dataview, int feature_i
 
     int left_size = split_point;
     int right_size = int(current_feature.size()) - split_point;
-  
-    // Set sizes for GPU View allocation
-    left_dataview.gpu_view.num_instances = left_size;
-    right_dataview.gpu_view.num_instances = right_size;
 
     int feature_no = 0;
 
@@ -307,10 +308,29 @@ void Dataview::split_data_points(const Dataview& current_dataview, int feature_i
         });
     }
 
-    // If the parent has GPU data, split it for children
+    // --- GPU SPLIT OPTIMIZATION ---
+    // Use the reuse buffers if provided to avoid repetitive malloc/free
     if (current_dataview.gpu_view.d_values != nullptr) {
-        float threshold = current_feature[split_point].value; // Value at split boundary (Right starts here)
-        split_gpu_dataview(current_dataview.gpu_view, left_dataview.gpu_view, right_dataview.gpu_view, feature_index, threshold);
+        float threshold = current_feature[split_point].value; 
+        
+        if (reuse_left_gpu && reuse_right_gpu && d_map_buffer) {
+            // Reuse Pre-allocated Buffers
+            left_dataview.gpu_view = *reuse_left_gpu;
+            left_dataview.gpu_view.num_instances = left_size;
+            left_dataview.gpu_view.owns_memory = false; // Do not free borrowed memory
+
+            right_dataview.gpu_view = *reuse_right_gpu;
+            right_dataview.gpu_view.num_instances = right_size;
+            right_dataview.gpu_view.owns_memory = false;
+
+            split_gpu_dataview_preallocated(current_dataview.gpu_view, left_dataview.gpu_view, right_dataview.gpu_view, feature_index, threshold, d_map_buffer);
+
+        } else {
+            // Fallback: Standard Allocation (Slower)
+            left_dataview.gpu_view.num_instances = left_size;
+            right_dataview.gpu_view.num_instances = right_size;
+            split_gpu_dataview(current_dataview.gpu_view, left_dataview.gpu_view, right_dataview.gpu_view, feature_index, threshold);
+        }
     }
 }
 

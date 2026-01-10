@@ -1,4 +1,25 @@
 #include "general_solver.h"
+#include <cuda_runtime.h> // Required for cudaMalloc/cudaFree
+
+// Helper to allocate scratch buffers
+void allocate_scratch_gpu_view(GPUDataview& view, int num_instances, int num_features) {
+    view.num_features = num_features;
+    view.num_instances = num_instances; // Capacity matches the parent size (upper bound)
+    size_t elem_count = (size_t)num_instances * num_features;
+    
+    cudaMalloc((void**)&view.d_values, elem_count * sizeof(float));
+    cudaMalloc((void**)&view.d_labels, elem_count * sizeof(int));
+    cudaMalloc((void**)&view.d_row_indices, elem_count * sizeof(int));
+    
+    view.owns_memory = true; // Temporary owner, will be freed by free_scratch_gpu_view
+}
+
+void free_scratch_gpu_view(GPUDataview& view) {
+    if (view.d_values) cudaFree(view.d_values);
+    if (view.d_labels) cudaFree(view.d_labels);
+    if (view.d_row_indices) cudaFree(view.d_row_indices);
+    view.d_values = nullptr;
+}
 
 void GeneralSolver::create_optimal_decision_tree(const Dataview& dataview, const Configuration& solution_configuration, std::shared_ptr<Tree>& current_optimal_decision_tree, int upper_bound) {
     if (current_optimal_decision_tree->misclassification_score == 0 || dataview.get_dataset_size() == 0) {
@@ -50,8 +71,20 @@ void GeneralSolver::create_optimal_decision_tree(const Dataview& dataview, const
     std::queue<IntervalsPruner::Bound> unsearched_intervals;
     unsearched_intervals.push({0, (int)possible_split_indices.size() - 1, -1, -1});
 
+    // --- GPU MEMORY OPTIMIZATION ---
+    // Allocate scratch buffers ONCE here instead of inside the loop (O(1) vs O(N))
+    GPUDataview scratch_left, scratch_right;
+    int* d_map_buffer = nullptr;
+    bool using_gpu = (dataview.gpu_view.d_values != nullptr);
+
+    if (using_gpu) {
+        allocate_scratch_gpu_view(scratch_left, dataview.get_dataset_size(), dataview.get_feature_number());
+        allocate_scratch_gpu_view(scratch_right, dataview.get_dataset_size(), dataview.get_feature_number());
+        cudaMalloc((void**)&d_map_buffer, 10000000 * sizeof(int)); // Safe large buffer for indices
+    }
+
     while(!unsearched_intervals.empty()) {
-        if (!solution_configuration.stopwatch.IsWithinTimeLimit()) return;
+        if (!solution_configuration.stopwatch.IsWithinTimeLimit()) break;
         auto current_interval = unsearched_intervals.front(); unsearched_intervals.pop();
 
         if (interval_pruner.subinterval_pruning(current_interval, current_optimal_decision_tree->misclassification_score)) {
@@ -66,24 +99,22 @@ void GeneralSolver::create_optimal_decision_tree(const Dataview& dataview, const
 
         const int mid = (left + right) / 2;
         const int split_point = possible_split_indices[mid];
-
         const int interval_half_distance = std::max(split_point - possible_split_indices[left], possible_split_indices[right] - split_point);
-
         const float threshold = mid > 0 ? (current_feature[possible_split_indices[mid - 1]].value + current_feature[split_point].value) / 2.0f 
                                   : (current_feature[split_point].value + current_feature[0].value) / 2.0f;  
         const int split_unique_value_index = current_feature[split_point].unique_value_index;
 
         Dataview left_dataview = Dataview(dataview.get_class_number(), dataview.should_sort_by_gini_index());
         Dataview right_dataview = Dataview(dataview.get_class_number(), dataview.should_sort_by_gini_index());
-        Dataview::split_data_points(dataview, feature_index, split_point, split_unique_value_index, left_dataview, right_dataview, solution_configuration.max_depth);
+        
+        // Pass the pre-allocated buffers to split_data_points
+        Dataview::split_data_points(dataview, feature_index, split_point, split_unique_value_index, left_dataview, right_dataview, solution_configuration.max_depth, &scratch_left, &scratch_right, d_map_buffer);
 
         std::shared_ptr<Tree> left_optimal_dt  = std::make_shared<Tree>(-1, current_optimal_decision_tree->misclassification_score);
         std::shared_ptr<Tree> right_optimal_dt = std::make_shared<Tree>(-1, current_optimal_decision_tree->misclassification_score);
 
-        // Here firstly compute the bigger dataset since it might make computing the smaller dataset obsolete
         auto& smaller_data = (left_dataview.get_dataset_size() < right_dataview.get_dataset_size() ) ? left_dataview : right_dataview;
         auto& larger_data  = (left_dataview.get_dataset_size()  < right_dataview.get_dataset_size() ) ? right_dataview : left_dataview;
-
         auto& smaller_optimal_dt = (left_dataview.get_dataset_size()  < right_dataview.get_dataset_size() ) ? left_optimal_dt : right_optimal_dt;
         auto& larger_optimal_dt  = (left_dataview.get_dataset_size()  < right_dataview.get_dataset_size() ) ? right_optimal_dt : left_optimal_dt;
 
@@ -115,6 +146,12 @@ void GeneralSolver::create_optimal_decision_tree(const Dataview& dataview, const
                 current_optimal_decision_tree->update_split(feature_index, threshold, left_optimal_dt, right_optimal_dt);
 
                 if (current_best_score == 0) {
+                    // CLEANUP BEFORE RETURN
+                    if (using_gpu) {
+                        if (d_map_buffer) cudaFree(d_map_buffer);
+                        free_scratch_gpu_view(scratch_left);
+                        free_scratch_gpu_view(scratch_right);
+                    }
                     return;
                 }
 
@@ -144,6 +181,13 @@ void GeneralSolver::create_optimal_decision_tree(const Dataview& dataview, const
         if (left <= new_bound_right) {
             unsearched_intervals.push({left, new_bound_right, current_left_bound, mid});
         }
+    }
+
+    // FINAL CLEANUP
+    if (using_gpu) {
+        if (d_map_buffer) cudaFree(d_map_buffer);
+        free_scratch_gpu_view(scratch_left);
+        free_scratch_gpu_view(scratch_right);
     }
 }
 
