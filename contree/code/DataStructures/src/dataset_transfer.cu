@@ -1,16 +1,17 @@
+// code/DataStructures/src/dataset_transfer.cu
 #include "dataset.h"
 #include "gpu_structs.h"
 #include <vector>
 #include <cuda_runtime.h>
 
-// This function takes the CPU dataset, flattens it, and moves it to the GPU
+// --- Existing Upload Function ---
 GpuDataset UploadDatasetToGPU(const Dataset& cpu_dataset) {
     GpuDataset gpu_data;
     gpu_data.num_features = cpu_dataset.get_features_size();
     gpu_data.num_instances = cpu_dataset.get_instance_number();
-    gpu_data.total_elements = gpu_data.num_features * gpu_data.num_instances;
+    gpu_data.total_elements = (size_t)gpu_data.num_features * gpu_data.num_instances;
 
-    // 1. Allocate Temporary Host Memory (Pinned memory is faster for transfers)
+    // 1. Allocate Temporary Host Memory
     float* h_values;
     int* h_unique;
     int* h_indices;
@@ -21,8 +22,7 @@ GpuDataset UploadDatasetToGPU(const Dataset& cpu_dataset) {
     cudaMallocHost(&h_indices, gpu_data.total_elements * sizeof(int));
     cudaMallocHost(&h_labels, gpu_data.total_elements * sizeof(int));
 
-    // 2. Flatten the Data (AoS -> SoA Conversion)
-    // We iterate through features and stack them one after another
+    // 2. Flatten the Data
     size_t global_idx = 0;
     const auto& feature_data = cpu_dataset.get_features_data();
     
@@ -59,4 +59,30 @@ GpuDataset UploadDatasetToGPU(const Dataset& cpu_dataset) {
     cudaFreeHost(h_labels);
 
     return gpu_data;
+}
+
+// --- NEW IMPLEMENTATIONS ---
+
+void GpuDataset::free() {
+    if (values) cudaFree(values);
+    if (unique_value_indices) cudaFree(unique_value_indices);
+    if (data_point_indices) cudaFree(data_point_indices);
+    if (labels) cudaFree(labels);
+    
+    values = nullptr;
+    unique_value_indices = nullptr;
+    data_point_indices = nullptr;
+    labels = nullptr;
+}
+
+void GPUDataview::free() {
+    if (d_values) cudaFree(d_values);
+    if (d_labels) cudaFree(d_labels);
+    if (d_row_indices) cudaFree(d_row_indices);
+    if (d_unique_indices) cudaFree(d_unique_indices);
+    
+    d_values = nullptr;
+    d_labels = nullptr;
+    d_row_indices = nullptr;
+    d_unique_indices = nullptr;
 }
