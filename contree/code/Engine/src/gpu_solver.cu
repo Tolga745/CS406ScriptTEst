@@ -321,7 +321,7 @@ void run_specialized_solver_gpu(
     int* h_best_scores_left, float* h_best_thresholds_left, int* h_best_labels_left_L, int* h_best_labels_left_R, int* h_best_child_scores_left_L, int* h_best_child_scores_left_R, int* h_leaf_scores_left, int* h_leaf_labels_left,
     int* h_best_scores_right, float* h_best_thresholds_right, int* h_best_labels_right_L, int* h_best_labels_right_R, int* h_best_child_scores_right_L, int* h_best_child_scores_right_R, int* h_leaf_scores_right, int* h_leaf_labels_right
 ) {
-    if (dataview.num_classes > MAX_CLASSES) { std::cerr << \"ERR: Class limit exceeded\" << std::endl; exit(1); }
+    if (dataview.num_classes > MAX_CLASSES) { std::cerr << "ERR: Class limit exceeded" << std::endl; exit(1); }
 
     // PERFORMANCE FIX: Use Pre-allocated Buffers from global_gpu_dataset
     // We assume global_gpu_dataset is initialized and large enough.
