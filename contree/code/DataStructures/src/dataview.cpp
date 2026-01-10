@@ -116,21 +116,21 @@ Dataview::Dataview(Dataset* sorted_dataset, Dataset* unsorted_dataset, int class
     }
 
     // --- GPU VIEW INITIALIZATION ---
-    // If this is the Root Dataview, link it to the Global GPU Dataset.
-    // We check if global dataset is initialized and sizes match.
     if (global_gpu_dataset.d_values != nullptr && 
         sorted_dataset->get_instance_number() == global_gpu_dataset.num_instances) {
         
         gpu_view.d_values = global_gpu_dataset.d_values;
         gpu_view.d_labels = global_gpu_dataset.d_labels;
         gpu_view.d_row_indices = global_gpu_dataset.d_original_indices;
-        
         gpu_view.num_instances = global_gpu_dataset.num_instances;
         gpu_view.num_features = global_gpu_dataset.num_features;
         gpu_view.num_classes = global_gpu_dataset.num_classes;
-        
-        gpu_view.owns_memory = false; // Do not free Global Data
+        gpu_view.owns_memory = false; 
     }
+}
+
+Dataview::Dataview(int class_number, const bool sort_by_gini_index) 
+    : class_number(class_number), sort_by_gini_index(sort_by_gini_index) {
 }
 
 int Dataview::get_dataset_size() const {
@@ -161,7 +161,7 @@ const std::vector<int>& Dataview::get_possible_split_indices(int feature_index) 
     return possible_split_indices[feature_index];
 }
 
-void Dataview::split_data_points(const Dataview& current_dataview, int feature_index, int split_point, int split_unique_value_index, Dataview& left_dataview, Dataview& right_dataview, int current_max_depth, GPUDataview* reuse_left_gpu, GPUDataview* reuse_right_gpu, int* d_map_buffer) {
+void Dataview::split_data_points(const Dataview& current_dataview, int feature_index, int split_point, int split_unique_value_index, float threshold, Dataview& left_dataview, Dataview& right_dataview, int current_max_depth, GPUDataview* reuse_left_gpu, GPUDataview* reuse_right_gpu, int* d_map_buffer) {
     left_dataview.feature_data.resize(current_dataview.get_feature_number());
     right_dataview.feature_data.resize(current_dataview.get_feature_number());
 
@@ -172,7 +172,6 @@ void Dataview::split_data_points(const Dataview& current_dataview, int feature_i
     right_dataview.gini_values.resize(current_dataview.get_feature_number());
 
     const int class_number = current_dataview.get_class_number();
-
     const auto& current_feature = current_dataview.get_sorted_dataset_feature(feature_index);
     const auto& unsorted_split_feature = current_dataview.unsorted_dataset->feature_data[feature_index];
 
@@ -186,7 +185,6 @@ void Dataview::split_data_points(const Dataview& current_dataview, int feature_i
     for (const auto& it : current_dataview.feature_data) {
         auto& left_split_feature_data = left_dataview.feature_data[feature_no];
         left_split_feature_data.resize(left_size);
-
         auto& right_split_feature_data = right_dataview.feature_data[feature_no];
         right_split_feature_data.resize(right_size);
         
@@ -303,16 +301,14 @@ void Dataview::split_data_points(const Dataview& current_dataview, int feature_i
         });
     }
 
-    // --- GPU SPLIT OPTIMIZATION ---
-    // Use the reuse buffers if provided to avoid repetitive malloc/free
+    // --- GPU SPLIT ---
     if (current_dataview.gpu_view.d_values != nullptr) {
-        float threshold = current_feature[split_point].value; 
+        // UPDATED: Use the passed safe threshold instead of recalculating
         
         if (reuse_left_gpu && reuse_right_gpu && d_map_buffer) {
-            // Reuse Pre-allocated Buffers
             left_dataview.gpu_view = *reuse_left_gpu;
             left_dataview.gpu_view.num_instances = left_size;
-            left_dataview.gpu_view.owns_memory = false; // Do not free borrowed memory
+            left_dataview.gpu_view.owns_memory = false; 
 
             right_dataview.gpu_view = *reuse_right_gpu;
             right_dataview.gpu_view.num_instances = right_size;
@@ -321,7 +317,6 @@ void Dataview::split_data_points(const Dataview& current_dataview, int feature_i
             split_gpu_dataview_preallocated(current_dataview.gpu_view, left_dataview.gpu_view, right_dataview.gpu_view, feature_index, threshold, d_map_buffer);
 
         } else {
-            // Fallback: Standard Allocation (Slower)
             left_dataview.gpu_view.num_instances = left_size;
             right_dataview.gpu_view.num_instances = right_size;
             split_gpu_dataview(current_dataview.gpu_view, left_dataview.gpu_view, right_dataview.gpu_view, feature_index, threshold);

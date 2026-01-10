@@ -57,7 +57,6 @@ void GeneralSolver::create_optimal_decision_tree(const Dataview& dataview, const
     bool using_gpu = (dataview.gpu_view.d_values != nullptr);
 
     if (using_gpu) {
-        // Use wrappers defined in gpu_dataview.h/.cu
         allocate_scratch_gpu_view(scratch_left, dataview.get_dataset_size(), dataview.get_feature_number());
         allocate_scratch_gpu_view(scratch_right, dataview.get_dataset_size(), dataview.get_feature_number());
         allocate_int_buffer(&d_map_buffer, 10000000); 
@@ -87,8 +86,8 @@ void GeneralSolver::create_optimal_decision_tree(const Dataview& dataview, const
         Dataview left_dataview = Dataview(dataview.get_class_number(), dataview.should_sort_by_gini_index());
         Dataview right_dataview = Dataview(dataview.get_class_number(), dataview.should_sort_by_gini_index());
         
-        // Pass the pre-allocated buffers to split_data_points
-        Dataview::split_data_points(dataview, feature_index, split_point, split_unique_value_index, left_dataview, right_dataview, solution_configuration.max_depth, &scratch_left, &scratch_right, d_map_buffer);
+        // Pass the calculated 'threshold' to split_data_points
+        Dataview::split_data_points(dataview, feature_index, split_point, split_unique_value_index, threshold, left_dataview, right_dataview, solution_configuration.max_depth, &scratch_left, &scratch_right, d_map_buffer);
 
         std::shared_ptr<Tree> left_optimal_dt  = std::make_shared<Tree>(-1, current_optimal_decision_tree->misclassification_score);
         std::shared_ptr<Tree> right_optimal_dt = std::make_shared<Tree>(-1, current_optimal_decision_tree->misclassification_score);
