@@ -2,10 +2,103 @@
 #include <cuda_runtime.h>
 #include <iostream>
 #include <vector>
+#include <algorithm>
 
 // --- CONSTANTS ---
 #define MAX_CLASSES 32 
 #define MAX_COUNTERS (MAX_CLASSES * 2)
+
+GPUDataset global_gpu_dataset;
+
+// --- GPUDataset IMPLEMENTATION ---
+
+void GPUDataset::initialize(const Dataset& cpu_dataset) {
+    this->num_features = cpu_dataset.get_features_size();
+    this->num_instances = cpu_dataset.get_instance_number();
+    
+    // Calculate total elements
+    size_t total_elements = (size_t)this->num_features * this->num_instances;
+    
+    // Allocate Host Memory for flattening
+    float* h_values;
+    int* h_labels;
+    int* h_indices;
+    // We scan for max label to set num_classes
+    int max_label = 0;
+
+    cudaMallocHost(&h_values, total_elements * sizeof(float));
+    cudaMallocHost(&h_labels, total_elements * sizeof(int));
+    cudaMallocHost(&h_indices, total_elements * sizeof(int));
+
+    // Flatten Data (Feature-Major Order)
+    size_t global_idx = 0;
+    const auto& feature_data = cpu_dataset.get_features_data();
+
+    for (int f = 0; f < this->num_features; f++) {
+        const auto& current_feat_vec = feature_data[f];
+        for (int i = 0; i < this->num_instances; i++) {
+            const auto& element = current_feat_vec[i];
+            
+            h_values[global_idx] = element.value;
+            h_labels[global_idx] = element.label;
+            h_indices[global_idx] = element.data_point_index;
+            
+            if (element.label > max_label) max_label = element.label;
+
+            global_idx++;
+        }
+    }
+    this->num_classes = max_label + 1;
+
+    // Allocate GPU Memory (Data)
+    cudaMalloc(&d_values, total_elements * sizeof(float));
+    cudaMalloc(&d_labels, total_elements * sizeof(int));
+    cudaMalloc(&d_original_indices, total_elements * sizeof(int));
+    d_feature_offsets = nullptr; // Unused in current kernel
+
+    // Copy to GPU
+    cudaMemcpy(d_values, h_values, total_elements * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_labels, h_labels, total_elements * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_original_indices, h_indices, total_elements * sizeof(int), cudaMemcpyHostToDevice);
+
+    // Allocate GPU Memory (Buffers)
+    cudaMalloc(&d_assignment_buffer, this->num_instances * sizeof(int));
+    
+    size_t int_bytes_feats = this->num_features * sizeof(int);
+    size_t float_bytes_feats = this->num_features * sizeof(float);
+
+    cudaMalloc(&d_score_L, int_bytes_feats); cudaMalloc(&d_score_R, int_bytes_feats);
+    cudaMalloc(&d_thresh_L, float_bytes_feats); cudaMalloc(&d_thresh_R, float_bytes_feats);
+    cudaMalloc(&d_lbl_L_L, int_bytes_feats); cudaMalloc(&d_lbl_L_R, int_bytes_feats);
+    cudaMalloc(&d_lbl_R_L, int_bytes_feats); cudaMalloc(&d_lbl_R_R, int_bytes_feats);
+    cudaMalloc(&d_cscore_L_L, int_bytes_feats); cudaMalloc(&d_cscore_L_R, int_bytes_feats);
+    cudaMalloc(&d_cscore_R_L, int_bytes_feats); cudaMalloc(&d_cscore_R_R, int_bytes_feats);
+    cudaMalloc(&d_leaf_L, int_bytes_feats); cudaMalloc(&d_leaf_R, int_bytes_feats);
+    cudaMalloc(&d_leaflbl_L, int_bytes_feats); cudaMalloc(&d_leaflbl_R, int_bytes_feats);
+
+    // Free Host Memory
+    cudaFreeHost(h_values);
+    cudaFreeHost(h_labels);
+    cudaFreeHost(h_indices);
+}
+
+void GPUDataset::free() {
+    if (d_values) cudaFree(d_values);
+    if (d_labels) cudaFree(d_labels);
+    if (d_original_indices) cudaFree(d_original_indices);
+    if (d_assignment_buffer) cudaFree(d_assignment_buffer);
+    
+    if (d_score_L) cudaFree(d_score_L); if (d_score_R) cudaFree(d_score_R);
+    if (d_thresh_L) cudaFree(d_thresh_L); if (d_thresh_R) cudaFree(d_thresh_R);
+    if (d_lbl_L_L) cudaFree(d_lbl_L_L); if (d_lbl_L_R) cudaFree(d_lbl_L_R);
+    if (d_lbl_R_L) cudaFree(d_lbl_R_L); if (d_lbl_R_R) cudaFree(d_lbl_R_R);
+    if (d_cscore_L_L) cudaFree(d_cscore_L_L); if (d_cscore_L_R) cudaFree(d_cscore_L_R);
+    if (d_cscore_R_L) cudaFree(d_cscore_R_L); if (d_cscore_R_R) cudaFree(d_cscore_R_R);
+    if (d_leaf_L) cudaFree(d_leaf_L); if (d_leaf_R) cudaFree(d_leaf_R);
+    if (d_leaflbl_L) cudaFree(d_leaflbl_L); if (d_leaflbl_R) cudaFree(d_leaflbl_R);
+
+    d_values = nullptr;
+}
 
 // --- KERNELS ---
 
