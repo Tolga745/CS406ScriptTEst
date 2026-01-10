@@ -17,19 +17,9 @@ int* g_pinned_assignment_buffer = nullptr;
 // Pool of CUDA Streams
 cudaStream_t g_streams[NUM_STREAMS];
 
-__device__ int calculate_misclassification(int* counts, int num_classes, int total_count, int& best_label_out) {
-    int max_freq = 0;
-    int best_label = 0;
-    for(int c = 0; c < num_classes; ++c) {
-        if(counts[c] > max_freq) {
-            max_freq = counts[c];
-            best_label = c;
-        }
-    }
-    best_label_out = best_label;
-    return total_count - max_freq;
-}
-
+// ---------------------------------------------------------
+// NEW KERNEL: Generate Assignments on GPU
+// ---------------------------------------------------------
 __global__ void generate_assignments_kernel(
     const float* __restrict__ values,
     const int* __restrict__ original_indices,
@@ -50,6 +40,19 @@ __global__ void generate_assignments_kernel(
         // 0 for Left (< threshold), 1 for Right (>= threshold)
         active_mask[orig_idx] = (values[global_idx] < threshold) ? 0 : 1;
     }
+}
+
+__device__ int calculate_misclassification(int* counts, int num_classes, int total_count, int& best_label_out) {
+    int max_freq = 0;
+    int best_label = 0;
+    for(int c = 0; c < num_classes; ++c) {
+        if(counts[c] > max_freq) {
+            max_freq = counts[c];
+            best_label = c;
+        }
+    }
+    best_label_out = best_label;
+    return total_count - max_freq;
 }
 
 __global__ void compute_splits_kernel(
@@ -298,44 +301,49 @@ __global__ void compute_splits_kernel(
     }
 }
 
-void launch_specialized_solver_kernel(
-    const std::vector<int>& active_indices,
-    const std::vector<int>& split_assignment,
+// ---------------------------------------------------------
+// NEW LAUNCHER (Fast Path)
+// ---------------------------------------------------------
+void launch_specialized_solver_kernel_gpu_gen(
+    int feature_index,
+    float threshold,
     int upper_bound,
     int* h_best_scores_left, float* h_best_thresholds_left, int* h_best_labels_left_L, int* h_best_labels_left_R, int* h_best_child_scores_left_L, int* h_best_child_scores_left_R, int* h_leaf_scores_left, int* h_leaf_labels_left,
     int* h_best_scores_right, float* h_best_thresholds_right, int* h_best_labels_right_L, int* h_best_labels_right_R, int* h_best_child_scores_right_L, int* h_best_child_scores_right_R, int* h_leaf_scores_right, int* h_leaf_labels_right
 ) {
     if (global_gpu_dataset.num_classes > MAX_CLASSES) {
-        std::cerr << "ERROR: Dataset has " << global_gpu_dataset.num_classes 
-                  << " classes, but MAX_CLASSES is " << MAX_CLASSES 
-                  << ". Increase MAX_CLASSES in gpu_solver.cu!" << std::endl;
+        std::cerr << "ERROR: Dataset has " << global_gpu_dataset.num_classes << " classes, but MAX_CLASSES is " << MAX_CLASSES << ". Increase MAX_CLASSES in gpu_solver.cu!" << std::endl;
         exit(1);
     }
-
-    // ---------------------------------------------------------
-    // NEW: Hybrid Parallelism with CUDA Streams
-    // ---------------------------------------------------------
-    // 1. Get thread ID from OpenMP (assumes openmp is used in general_solver)
+    
     int thread_id = 0;
     #ifdef _OPENMP
         thread_id = omp_get_thread_num();
     #endif
-    
-    // 2. Select stream from pool to avoid blocking other threads
     cudaStream_t stream = g_streams[thread_id % NUM_STREAMS];
 
-    
-    cudaMemcpyAsync(global_gpu_dataset.d_assignment_buffer, split_assignment.data(), 
-                    split_assignment.size() * sizeof(int), cudaMemcpyHostToDevice, stream);
+    int num_instances = global_gpu_dataset.num_instances;
+    int blockSize = 256;
+    int gridSize = (num_instances + blockSize - 1) / blockSize;
 
-    
+    // KERNEL 1: Generate Assignments
+    generate_assignments_kernel<<<gridSize, blockSize, 0, stream>>>(
+        global_gpu_dataset.d_values,
+        global_gpu_dataset.d_original_indices,
+        global_gpu_dataset.d_feature_offsets,
+        global_gpu_dataset.d_assignment_buffer,
+        feature_index,
+        threshold,
+        num_instances
+    );
+
+    // KERNEL 2: Compute Splits
     int num_feats = global_gpu_dataset.num_features;
     size_t int_bytes = num_feats * sizeof(int);
     size_t float_bytes = num_feats * sizeof(float);
-    int block_size = 256;
-    size_t shared_mem_size = (block_size * global_gpu_dataset.num_classes * 2) * sizeof(int);
+    size_t shared_mem_size = (256 * global_gpu_dataset.num_classes * 2) * sizeof(int);
 
-    compute_splits_kernel<<<num_feats, block_size, shared_mem_size, stream>>>(
+    compute_splits_kernel<<<num_feats, 256, shared_mem_size, stream>>>(
         global_gpu_dataset.d_values, global_gpu_dataset.d_labels, global_gpu_dataset.d_original_indices, global_gpu_dataset.d_feature_offsets, 
         global_gpu_dataset.d_assignment_buffer,
         num_feats, global_gpu_dataset.num_instances, global_gpu_dataset.num_classes,
@@ -343,7 +351,6 @@ void launch_specialized_solver_kernel(
         global_gpu_dataset.d_score_R, global_gpu_dataset.d_thresh_R, global_gpu_dataset.d_lbl_R_L, global_gpu_dataset.d_lbl_R_R, global_gpu_dataset.d_cscore_R_L, global_gpu_dataset.d_cscore_R_R, global_gpu_dataset.d_leaf_R, global_gpu_dataset.d_leaflbl_R
     );
 
-    // Retrieve results Async
     cudaMemcpyAsync(h_best_scores_left, global_gpu_dataset.d_score_L, int_bytes, cudaMemcpyDeviceToHost, stream);
     cudaMemcpyAsync(h_best_thresholds_left, global_gpu_dataset.d_thresh_L, float_bytes, cudaMemcpyDeviceToHost, stream);
     cudaMemcpyAsync(h_best_labels_left_L, global_gpu_dataset.d_lbl_L_L, int_bytes, cudaMemcpyDeviceToHost, stream);
@@ -362,7 +369,67 @@ void launch_specialized_solver_kernel(
     cudaMemcpyAsync(h_leaf_scores_right, global_gpu_dataset.d_leaf_R, int_bytes, cudaMemcpyDeviceToHost, stream);
     cudaMemcpyAsync(h_leaf_labels_right, global_gpu_dataset.d_leaflbl_R, int_bytes, cudaMemcpyDeviceToHost, stream);
 
-    // Sync ONLY this stream
+    cudaStreamSynchronize(stream);
+}
+
+// ---------------------------------------------------------
+// OLD LAUNCHER (Slow Path / Fallback)
+// ---------------------------------------------------------
+void launch_specialized_solver_kernel(
+    const std::vector<int>& active_indices,
+    const std::vector<int>& split_assignment,
+    int upper_bound,
+    int* h_best_scores_left, float* h_best_thresholds_left, int* h_best_labels_left_L, int* h_best_labels_left_R, int* h_best_child_scores_left_L, int* h_best_child_scores_left_R, int* h_leaf_scores_left, int* h_leaf_labels_left,
+    int* h_best_scores_right, float* h_best_thresholds_right, int* h_best_labels_right_L, int* h_best_labels_right_R, int* h_best_child_scores_right_L, int* h_best_child_scores_right_R, int* h_leaf_scores_right, int* h_leaf_labels_right
+) {
+    if (global_gpu_dataset.num_classes > MAX_CLASSES) {
+        std::cerr << "ERROR: Dataset has " << global_gpu_dataset.num_classes 
+                  << " classes, but MAX_CLASSES is " << MAX_CLASSES 
+                  << ". Increase MAX_CLASSES in gpu_solver.cu!" << std::endl;
+        exit(1);
+    }
+
+    int thread_id = 0;
+    #ifdef _OPENMP
+        thread_id = omp_get_thread_num();
+    #endif
+    cudaStream_t stream = g_streams[thread_id % NUM_STREAMS];
+
+    cudaMemcpyAsync(global_gpu_dataset.d_assignment_buffer, split_assignment.data(), 
+                    split_assignment.size() * sizeof(int), cudaMemcpyHostToDevice, stream);
+
+    int num_feats = global_gpu_dataset.num_features;
+    size_t int_bytes = num_feats * sizeof(int);
+    size_t float_bytes = num_feats * sizeof(float);
+    int block_size = 256;
+    size_t shared_mem_size = (block_size * global_gpu_dataset.num_classes * 2) * sizeof(int);
+
+    compute_splits_kernel<<<num_feats, block_size, shared_mem_size, stream>>>(
+        global_gpu_dataset.d_values, global_gpu_dataset.d_labels, global_gpu_dataset.d_original_indices, global_gpu_dataset.d_feature_offsets, 
+        global_gpu_dataset.d_assignment_buffer,
+        num_feats, global_gpu_dataset.num_instances, global_gpu_dataset.num_classes,
+        global_gpu_dataset.d_score_L, global_gpu_dataset.d_thresh_L, global_gpu_dataset.d_lbl_L_L, global_gpu_dataset.d_lbl_L_R, global_gpu_dataset.d_cscore_L_L, global_gpu_dataset.d_cscore_L_R, global_gpu_dataset.d_leaf_L, global_gpu_dataset.d_leaflbl_L,
+        global_gpu_dataset.d_score_R, global_gpu_dataset.d_thresh_R, global_gpu_dataset.d_lbl_R_L, global_gpu_dataset.d_lbl_R_R, global_gpu_dataset.d_cscore_R_L, global_gpu_dataset.d_cscore_R_R, global_gpu_dataset.d_leaf_R, global_gpu_dataset.d_leaflbl_R
+    );
+
+    cudaMemcpyAsync(h_best_scores_left, global_gpu_dataset.d_score_L, int_bytes, cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(h_best_thresholds_left, global_gpu_dataset.d_thresh_L, float_bytes, cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(h_best_labels_left_L, global_gpu_dataset.d_lbl_L_L, int_bytes, cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(h_best_labels_left_R, global_gpu_dataset.d_lbl_L_R, int_bytes, cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(h_best_child_scores_left_L, global_gpu_dataset.d_cscore_L_L, int_bytes, cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(h_best_child_scores_left_R, global_gpu_dataset.d_cscore_L_R, int_bytes, cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(h_leaf_scores_left, global_gpu_dataset.d_leaf_L, int_bytes, cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(h_leaf_labels_left, global_gpu_dataset.d_leaflbl_L, int_bytes, cudaMemcpyDeviceToHost, stream);
+
+    cudaMemcpyAsync(h_best_scores_right, global_gpu_dataset.d_score_R, int_bytes, cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(h_best_thresholds_right, global_gpu_dataset.d_thresh_R, float_bytes, cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(h_best_labels_right_L, global_gpu_dataset.d_lbl_R_L, int_bytes, cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(h_best_labels_right_R, global_gpu_dataset.d_lbl_R_R, int_bytes, cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(h_best_child_scores_right_L, global_gpu_dataset.d_cscore_R_L, int_bytes, cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(h_best_child_scores_right_R, global_gpu_dataset.d_cscore_R_R, int_bytes, cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(h_leaf_scores_right, global_gpu_dataset.d_leaf_R, int_bytes, cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(h_leaf_labels_right, global_gpu_dataset.d_leaflbl_R, int_bytes, cudaMemcpyDeviceToHost, stream);
+
     cudaStreamSynchronize(stream);
 }
 
