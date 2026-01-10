@@ -311,12 +311,12 @@ void Dataview::split_data_points(const Dataview& current_dataview, int feature_i
             right_dataview.gpu_view.num_instances = right_size;
             right_dataview.gpu_view.owns_memory = false;
 
-            split_gpu_dataview_preallocated(current_dataview.gpu_view, left_dataview.gpu_view, right_dataview.gpu_view, feature_index, threshold, d_map_buffer);
+            split_gpu_dataview_preallocated(current_dataview.gpu_view, left_dataview.gpu_view, right_dataview.gpu_view, feature_index, split_point, d_map_buffer);
 
         } else {
             left_dataview.gpu_view.num_instances = left_size;
             right_dataview.gpu_view.num_instances = right_size;
-            split_gpu_dataview(current_dataview.gpu_view, left_dataview.gpu_view, right_dataview.gpu_view, feature_index, threshold);
+            split_gpu_dataview(current_dataview.gpu_view, left_dataview.gpu_view, right_dataview.gpu_view, feature_index, split_point);
         }
     }
 }

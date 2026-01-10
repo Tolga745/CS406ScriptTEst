@@ -22,19 +22,19 @@ struct RowSidePredicate {
     }
 };
 
-// Kernel to generate the Left/Right map based on threshold
+// UPDATED: Kernel now uses index (split_point) instead of threshold.
+// Since data is sorted by feature, idx < split_point is robust.
 __global__ void mark_split_indices_kernel(
-    const float* feature_values,
     const int* original_indices,
     int* row_to_side_map, 
     int num_instances,
-    float threshold
+    int split_point
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < num_instances) {
         int row_id = original_indices[idx];
-        // If value < threshold, go Left (0), else Right (1)
-        row_to_side_map[row_id] = (feature_values[idx] < threshold) ? 0 : 1;
+        // If idx < split_point, go Left (0), else Right (1)
+        row_to_side_map[row_id] = (idx < split_point) ? 0 : 1;
     }
 }
 
@@ -70,7 +70,8 @@ void partition_column(const GPUDataview& parent, GPUDataview& left, GPUDataview&
     );
 }
 
-void split_gpu_dataview(const GPUDataview& parent, GPUDataview& left, GPUDataview& right, int split_feat_idx, float threshold, cudaStream_t stream) {
+// UPDATED: Signature and kernel call
+void split_gpu_dataview(const GPUDataview& parent, GPUDataview& left, GPUDataview& right, int split_feat_idx, int split_point, cudaStream_t stream) {
     // 1. Setup metadata
     left.num_features = parent.num_features; left.num_classes = parent.num_classes;
     left.owns_memory = true;
@@ -79,7 +80,6 @@ void split_gpu_dataview(const GPUDataview& parent, GPUDataview& left, GPUDatavie
     right.owns_memory = true;
     
     // 2. Allocate Temporary Map
-    
     int max_rows = 10000000; 
     int* d_row_map;
     cudaMalloc(&d_row_map, max_rows * sizeof(int));
@@ -89,26 +89,21 @@ void split_gpu_dataview(const GPUDataview& parent, GPUDataview& left, GPUDatavie
     int blockSize = 256;
     int gridSize = (parent.num_instances + blockSize - 1) / blockSize;
     
+    // UPDATED: Pass split_point instead of threshold. No need for d_values here.
     mark_split_indices_kernel<<<gridSize, blockSize, 0, stream>>>(
-        parent.d_values + offset,
         parent.d_row_indices + offset,
         d_row_map,
         parent.num_instances,
-        threshold
+        split_point
     );
 
     // 4. Allocate Memory for Children
-    // We already know left/right sizes from the Dataview object (populated by CPU logic before calling this)
-    // Wait, caller (dataview.cpp) must set num_instances before calling!
-    // Assuming left.num_instances and right.num_instances are set.
-    
     size_t left_elem = (size_t)left.num_instances * left.num_features;
     size_t right_elem = (size_t)right.num_instances * right.num_features;
 
     cudaMalloc(&left.d_values, left_elem * sizeof(float));
     cudaMalloc(&left.d_labels, left_elem * sizeof(int));
     cudaMalloc(&left.d_row_indices, left_elem * sizeof(int));
-    // unique indices optional, skipping for now to save memory/time
 
     cudaMalloc(&right.d_values, right_elem * sizeof(float));
     cudaMalloc(&right.d_labels, right_elem * sizeof(int));
@@ -122,16 +117,17 @@ void split_gpu_dataview(const GPUDataview& parent, GPUDataview& left, GPUDatavie
     cudaFree(d_row_map);
 }
 
-void split_gpu_dataview_preallocated(const GPUDataview& parent, GPUDataview& left, GPUDataview& right, int split_feat_idx, float threshold, int* d_row_map_buffer, cudaStream_t stream) {
-    // Assumes left.d_values, right.d_values etc are already pointing to valid memory 
-    // AND left.num_instances/right.num_instances are set.
+// UPDATED: Signature and kernel call
+void split_gpu_dataview_preallocated(const GPUDataview& parent, GPUDataview& left, GPUDataview& right, int split_feat_idx, int split_point, int* d_row_map_buffer, cudaStream_t stream) {
     
     // 1. Mark split
     int offset = split_feat_idx * parent.num_instances;
     int blockSize = 256;
     int gridSize = (parent.num_instances + blockSize - 1) / blockSize;
+    
+    // UPDATED: Pass split_point
     mark_split_indices_kernel<<<gridSize, blockSize, 0, stream>>>(
-        parent.d_values + offset, parent.d_row_indices + offset, d_row_map_buffer, parent.num_instances, threshold
+        parent.d_row_indices + offset, d_row_map_buffer, parent.num_instances, split_point
     );
 
     // 2. Partition
