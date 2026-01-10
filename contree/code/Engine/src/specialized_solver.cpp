@@ -13,32 +13,8 @@ void SpecializedSolver::create_optimal_decision_tree(const Dataview& dataview, c
 }
 
 void SpecializedSolver::get_best_left_right_scores(const Dataview& dataview, int feature_index, int split_point, float threshold, std::shared_ptr<Tree> &left_optimal_dt, std::shared_ptr<Tree> &right_optimal_dt, int upper_bound) {
-    const auto& split_feature = dataview.get_sorted_dataset_feature(feature_index);
-    const auto& unsorted_split_feature = dataview.get_unsorted_dataset_feature(feature_index);
-    std::vector<int> split_feature_split_indices(unsorted_split_feature.size());
-    int split_index = -1;
-    for (const auto& split_feature_data : split_feature) {
-        split_feature_split_indices[split_feature_data.data_point_index] = split_feature_data.unique_value_index;
-        if (split_index == -1 && split_feature_data.value >= threshold) {
-            split_index = split_feature_data.unique_value_index;
-        }
-    }
-    RUNTIME_ASSERT(split_index != -1, "Split index not found.");
     
-    // 1. Prepare Data
-    int dataset_size = dataview.get_dataset_size();
-    std::vector<int> active_indices;
-    std::vector<int> assignments;
-    active_indices.reserve(dataset_size);
-    assignments.reserve(dataset_size);
-
-    for (const auto& element : split_feature) {
-        active_indices.push_back(element.data_point_index);
-        int side = (element.unique_value_index < split_index) ? 0 : 1;
-        assignments.push_back(side);
-    }
-
-    // 2. Allocate Output Arrays
+    // 1. Allocate Output Arrays (Common for both paths)
     int num_features = dataview.get_feature_number();
     std::vector<int> left_scores(num_features), left_labels_L(num_features), left_labels_R(num_features), left_child_scores_L(num_features), left_child_scores_R(num_features), left_leaf_scores(num_features), left_leaf_labels(num_features);
     std::vector<float> left_thresholds(num_features);
@@ -46,14 +22,62 @@ void SpecializedSolver::get_best_left_right_scores(const Dataview& dataview, int
     std::vector<int> right_scores(num_features), right_labels_L(num_features), right_labels_R(num_features), right_child_scores_L(num_features), right_child_scores_R(num_features), right_leaf_scores(num_features), right_leaf_labels(num_features);
     std::vector<float> right_thresholds(num_features);
 
-    // 3. Launch
-    launch_specialized_solver_kernel(
-        active_indices, assignments, upper_bound,
-        left_scores.data(), left_thresholds.data(), left_labels_L.data(), left_labels_R.data(), left_child_scores_L.data(), left_child_scores_R.data(), left_leaf_scores.data(), left_leaf_labels.data(),
-        right_scores.data(), right_thresholds.data(), right_labels_L.data(), right_labels_R.data(), right_child_scores_L.data(), right_child_scores_R.data(), right_leaf_scores.data(), right_leaf_labels.data()
-    );
+    // 2. Select Execution Path
+    // Optimization: If we are at the Root (processing the full dataset), 
+    // we generate assignments directly on the GPU to save massive CPU->GPU transfer.
+    // Note: global_gpu_dataset must be visible (extern in gpu_solver.cuh)
+    
+    if (dataview.get_dataset_size() == global_gpu_dataset.num_instances) {
+        
+        // --- FAST PATH: GPU generates assignments ---
+        // Pass the rule (feature index + threshold) instead of the assignment vector
+        launch_specialized_solver_kernel_gpu_gen(
+            feature_index, 
+            threshold, 
+            upper_bound,
+            left_scores.data(), left_thresholds.data(), left_labels_L.data(), left_labels_R.data(), left_child_scores_L.data(), left_child_scores_R.data(), left_leaf_scores.data(), left_leaf_labels.data(),
+            right_scores.data(), right_thresholds.data(), right_labels_L.data(), right_labels_R.data(), right_child_scores_L.data(), right_child_scores_R.data(), right_leaf_scores.data(), right_leaf_labels.data()
+        );
 
-    // 4. Process Left Results
+    } else {
+        
+        // --- SLOW PATH: CPU calculates assignments (for subsets) ---
+        const auto& split_feature = dataview.get_sorted_dataset_feature(feature_index);
+        
+        // Calculate the unique value index where the split happens
+        int split_index = -1;
+        for (const auto& split_feature_data : split_feature) {
+            if (split_feature_data.value >= threshold) {
+                split_index = split_feature_data.unique_value_index;
+                break; 
+            }
+        }
+        RUNTIME_ASSERT(split_index != -1, "Split index not found.");
+        
+        int dataset_size = dataview.get_dataset_size();
+        std::vector<int> active_indices;
+        std::vector<int> assignments;
+        active_indices.reserve(dataset_size);
+        assignments.reserve(dataset_size);
+
+        for (const auto& element : split_feature) {
+            active_indices.push_back(element.data_point_index);
+            // 0 = Left, 1 = Right
+            int side = (element.unique_value_index < split_index) ? 0 : 1;
+            assignments.push_back(side);
+        }
+
+        // Launch original kernel which requires explicit assignments
+        launch_specialized_solver_kernel(
+            active_indices, 
+            assignments, 
+            upper_bound,
+            left_scores.data(), left_thresholds.data(), left_labels_L.data(), left_labels_R.data(), left_child_scores_L.data(), left_child_scores_R.data(), left_leaf_scores.data(), left_leaf_labels.data(),
+            right_scores.data(), right_thresholds.data(), right_labels_L.data(), right_labels_R.data(), right_child_scores_L.data(), right_child_scores_R.data(), right_leaf_scores.data(), right_leaf_labels.data()
+        );
+    }
+
+    // 3. Process Left Results (Common)
     int best_L_idx = -1;
     for(int i=0; i<num_features; ++i) {
         if(best_L_idx == -1 || left_scores[i] < left_scores[best_L_idx]) {
@@ -61,11 +85,8 @@ void SpecializedSolver::get_best_left_right_scores(const Dataview& dataview, int
         }
     }
     
-    // Check if we found a valid split that is BETTER than the leaf score
-    // (If kernel didn't find split, left_scores == left_leaf_scores)
     int leaf_score_L = left_leaf_scores[0]; 
     if (best_L_idx != -1 && left_scores[best_L_idx] < leaf_score_L) {
-        // We have a good split!
         left_optimal_dt->misclassification_score = left_scores[best_L_idx];
         left_optimal_dt->update_split(
             best_L_idx, left_thresholds[best_L_idx], 
@@ -73,12 +94,10 @@ void SpecializedSolver::get_best_left_right_scores(const Dataview& dataview, int
             std::make_shared<Tree>(left_labels_R[best_L_idx], left_child_scores_R[best_L_idx])
         );
     } else {
-        // No split found, or split is not better than just being a leaf.
-        // Make it a leaf!
         left_optimal_dt->make_leaf(left_leaf_labels[0], leaf_score_L);
     }
 
-    // 5. Process Right Results
+    // 4. Process Right Results (Common)
     int best_R_idx = -1;
     for(int i=0; i<num_features; ++i) {
         if(best_R_idx == -1 || right_scores[i] < right_scores[best_R_idx]) {

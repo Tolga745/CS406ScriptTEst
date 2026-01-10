@@ -30,6 +30,28 @@ __device__ int calculate_misclassification(int* counts, int num_classes, int tot
     return total_count - max_freq;
 }
 
+__global__ void generate_assignments_kernel(
+    const float* __restrict__ values,
+    const int* __restrict__ original_indices,
+    const int* __restrict__ feature_offsets,
+    int* __restrict__ active_mask,
+    int feature_index,
+    float threshold,
+    int count
+) {
+    // We process the specific feature column determining the split
+    int start_idx = feature_offsets[feature_index];
+    
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid < count) {
+        int global_idx = start_idx + tid;
+        int orig_idx = original_indices[global_idx];
+        
+        // 0 for Left (< threshold), 1 for Right (>= threshold)
+        active_mask[orig_idx] = (values[global_idx] < threshold) ? 0 : 1;
+    }
+}
+
 __global__ void compute_splits_kernel(
     const float* __restrict__ values,
     const int* __restrict__ labels,
