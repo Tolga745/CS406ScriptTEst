@@ -76,6 +76,8 @@ void GpuDataset::free() {
 }
 
 void GPUDataview::free() {
+    if (!owns_memory) return; 
+
     if (d_values) cudaFree(d_values);
     if (d_labels) cudaFree(d_labels);
     if (d_row_indices) cudaFree(d_row_indices);

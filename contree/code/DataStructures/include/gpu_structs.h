@@ -30,6 +30,7 @@ struct GPUDataview {
     int num_features = 0;
     int num_classes = 0;
 
+    bool owns_memory = true;
     // Declaration only - implementation moves to .cu file
     void free();
 };

@@ -1,4 +1,6 @@
 #include "dataview.h"
+#include "gpu_solver.cuh"
+#include "gpu_dataview.h"
 
 Dataview::Dataview(Dataset* sorted_dataset, Dataset* unsorted_dataset, int class_number, const bool sort_by_gini_index) 
     : unsorted_dataset(unsorted_dataset), label_frequency(class_number, 0), class_number(class_number), sort_by_gini_index(sort_by_gini_index) {
@@ -112,6 +114,23 @@ Dataview::Dataview(Dataset* sorted_dataset, Dataset* unsorted_dataset, int class
             return a.first < b.first;
         });
     }
+
+    // --- GPU VIEW INITIALIZATION ---
+    // If this is the Root Dataview, link it to the Global GPU Dataset.
+    // We check if global dataset is initialized and sizes match.
+    if (global_gpu_dataset.d_values != nullptr && 
+        sorted_dataset->get_instance_number() == global_gpu_dataset.num_instances) {
+        
+        gpu_view.d_values = global_gpu_dataset.d_values;
+        gpu_view.d_labels = global_gpu_dataset.d_labels;
+        gpu_view.d_row_indices = global_gpu_dataset.d_original_indices;
+        
+        gpu_view.num_instances = global_gpu_dataset.num_instances;
+        gpu_view.num_features = global_gpu_dataset.num_features;
+        gpu_view.num_classes = global_gpu_dataset.num_classes;
+        
+        gpu_view.owns_memory = false; // Do not free Global Data
+    }
 }
 
 int Dataview::get_dataset_size() const {
@@ -162,6 +181,10 @@ void Dataview::split_data_points(const Dataview& current_dataview, int feature_i
     int left_size = split_point;
     int right_size = int(current_feature.size()) - split_point;
   
+    // Set sizes for GPU View allocation
+    left_dataview.gpu_view.num_instances = left_size;
+    right_dataview.gpu_view.num_instances = right_size;
+
     int feature_no = 0;
 
     for (const auto& it : current_dataview.feature_data) {
@@ -282,6 +305,12 @@ void Dataview::split_data_points(const Dataview& current_dataview, int feature_i
         std::sort(right_dataview.gini_values.begin(), right_dataview.gini_values.end(), [](const std::pair<float, int>& a, const std::pair<float, int>& b) {
             return a.first < b.first;
         });
+    }
+
+    // If the parent has GPU data, split it for children
+    if (current_dataview.gpu_view.d_values != nullptr) {
+        float threshold = current_feature[split_point].value; // Value at split boundary (Right starts here)
+        split_gpu_dataview(current_dataview.gpu_view, left_dataview.gpu_view, right_dataview.gpu_view, feature_index, threshold);
     }
 }
 
