@@ -1,7 +1,9 @@
 cmake_minimum_required(VERSION 3.9)
 project(ConTree)
+project(ConTree LANGUAGES CXX CUDA)
 
 set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CUDA_STANDARD 14)
 
 find_package(OpenMP REQUIRED)
 
@@ -27,9 +29,9 @@ if (CMAKE_BUILD_TYPE STREQUAL Release)
         message(STATUS "Using MSVC compiler")
         add_compile_options(/Ot)
     else()
-        add_compile_options(-O3)
-        add_compile_options(-march=native)
-        add_compile_options(-funroll-loops)
+        add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-O3>)
+        add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-march=native>)
+        add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-funroll-loops>)
     endif()
 
 endif()
@@ -42,6 +44,10 @@ file(GLOB SRC_FILES
     ${CMAKE_CURRENT_SOURCE_DIR}/Utilities/src/*.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/Engine/src/*.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/main.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/DataStructures/src/dataset.cu
+    ${CMAKE_CURRENT_SOURCE_DIR}/Engine/src/gpu_solver.cu
+    ${CMAKE_CURRENT_SOURCE_DIR}/DataStructures/src/dataset_transfer.cu
+    ${CMAKE_CURRENT_SOURCE_DIR}/DataStructures/src/gpu_dataview.cu
 )
 
 # Define include directories
@@ -56,6 +62,8 @@ include_directories(${INCLUDE_DIRS})
 
 # Create the executable
 add_executable(ConTree ${SRC_FILES})
+
+target_compile_options(ConTree PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda>)
 
 target_link_libraries(ConTree PUBLIC OpenMP::OpenMP_CXX)
 

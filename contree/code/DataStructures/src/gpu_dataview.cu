@@ -1,0 +1,166 @@
+#include "gpu_dataview.h"
+#include <thrust/device_ptr.h>
+#include <thrust/partition.h>
+#include <thrust/execution_policy.h>
+#include <thrust/iterator/zip_iterator.h>
+#include <thrust/tuple.h>
+
+// Predicate to decide direction based on the Row Map
+// The input is a tuple: <value, label, original_index, unique_index> (or subset)
+// We only check original_index against the map.
+struct RowSidePredicate {
+    const int* row_map;
+    RowSidePredicate(const int* map) : row_map(map) {}
+
+    template <typename Tuple>
+    __device__ bool operator()(const Tuple& t) const {
+        // We assume the Original Index is the 3rd element (index 2) of the tuple
+        int original_idx = thrust::get<2>(t);
+        // Map: 0 = Left, 1 = Right
+        // Partition keeps elements where predicate is true in the first part (Left)
+        return row_map[original_idx] == 0; 
+    }
+};
+
+// UPDATED: Kernel now uses index (split_point) instead of threshold.
+// Since data is sorted by feature, idx < split_point is robust.
+__global__ void mark_split_indices_kernel(
+    const int* original_indices,
+    int* row_to_side_map, 
+    int num_instances,
+    int split_point
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < num_instances) {
+        int row_id = original_indices[idx];
+        // If idx < split_point, go Left (0), else Right (1)
+        row_to_side_map[row_id] = (idx < split_point) ? 0 : 1;
+    }
+}
+
+void partition_column(const GPUDataview& parent, GPUDataview& left, GPUDataview& right, int feature_idx, int* d_row_map, cudaStream_t stream) {
+    size_t p_offset = (size_t)feature_idx * parent.num_instances;
+    size_t l_offset = (size_t)feature_idx * left.num_instances;
+    size_t r_offset = (size_t)feature_idx * right.num_instances;
+
+    auto zip_in = thrust::make_zip_iterator(thrust::make_tuple(
+        thrust::device_pointer_cast(parent.d_values + p_offset),
+        thrust::device_pointer_cast(parent.d_labels + p_offset),
+        thrust::device_pointer_cast(parent.d_row_indices + p_offset)
+    ));
+
+    auto zip_out_left = thrust::make_zip_iterator(thrust::make_tuple(
+        thrust::device_pointer_cast(left.d_values + l_offset),
+        thrust::device_pointer_cast(left.d_labels + l_offset),
+        thrust::device_pointer_cast(left.d_row_indices + l_offset)
+    ));
+    
+    auto zip_out_right = thrust::make_zip_iterator(thrust::make_tuple(
+        thrust::device_pointer_cast(right.d_values + r_offset),
+        thrust::device_pointer_cast(right.d_labels + r_offset),
+        thrust::device_pointer_cast(right.d_row_indices + r_offset)
+    ));
+
+    thrust::stable_partition_copy(
+        thrust::cuda::par.on(stream),
+        zip_in, zip_in + parent.num_instances,
+        zip_out_left,
+        zip_out_right,
+        RowSidePredicate(d_row_map)
+    );
+}
+
+// UPDATED: Signature and kernel call
+void split_gpu_dataview(const GPUDataview& parent, GPUDataview& left, GPUDataview& right, int split_feat_idx, int split_point, cudaStream_t stream) {
+    // 1. Setup metadata
+    left.num_features = parent.num_features; left.num_classes = parent.num_classes;
+    left.owns_memory = true;
+
+    right.num_features = parent.num_features; right.num_classes = parent.num_classes;
+    right.owns_memory = true;
+    
+    // 2. Allocate Temporary Map
+    int max_rows = 10000000; 
+    int* d_row_map;
+    cudaMalloc(&d_row_map, max_rows * sizeof(int));
+
+    // 3. Mark the split
+    int offset = split_feat_idx * parent.num_instances;
+    int blockSize = 256;
+    int gridSize = (parent.num_instances + blockSize - 1) / blockSize;
+    
+    // UPDATED: Pass split_point instead of threshold. No need for d_values here.
+    mark_split_indices_kernel<<<gridSize, blockSize, 0, stream>>>(
+        parent.d_row_indices + offset,
+        d_row_map,
+        parent.num_instances,
+        split_point
+    );
+
+    // 4. Allocate Memory for Children
+    size_t left_elem = (size_t)left.num_instances * left.num_features;
+    size_t right_elem = (size_t)right.num_instances * right.num_features;
+
+    cudaMalloc(&left.d_values, left_elem * sizeof(float));
+    cudaMalloc(&left.d_labels, left_elem * sizeof(int));
+    cudaMalloc(&left.d_row_indices, left_elem * sizeof(int));
+
+    cudaMalloc(&right.d_values, right_elem * sizeof(float));
+    cudaMalloc(&right.d_labels, right_elem * sizeof(int));
+    cudaMalloc(&right.d_row_indices, right_elem * sizeof(int));
+
+    // 5. Partition Data
+    for (int f = 0; f < parent.num_features; f++) {
+        partition_column(parent, left, right, f, d_row_map, stream);
+    }
+
+    cudaFree(d_row_map);
+}
+
+// UPDATED: Signature and kernel call
+void split_gpu_dataview_preallocated(const GPUDataview& parent, GPUDataview& left, GPUDataview& right, int split_feat_idx, int split_point, int* d_row_map_buffer, cudaStream_t stream) {
+    
+    // 1. Mark split
+    int offset = split_feat_idx * parent.num_instances;
+    int blockSize = 256;
+    int gridSize = (parent.num_instances + blockSize - 1) / blockSize;
+    
+    // UPDATED: Pass split_point
+    mark_split_indices_kernel<<<gridSize, blockSize, 0, stream>>>(
+        parent.d_row_indices + offset, d_row_map_buffer, parent.num_instances, split_point
+    );
+
+    // 2. Partition
+    for (int f = 0; f < parent.num_features; f++) {
+        partition_column(parent, left, right, f, d_row_map_buffer, stream);
+    }
+}
+
+void allocate_scratch_gpu_view(GPUDataview& view, int num_instances, int num_features) {
+    view.num_features = num_features;
+    view.num_instances = num_instances;
+    size_t elem_count = (size_t)num_instances * num_features;
+    
+    cudaMalloc(&view.d_values, elem_count * sizeof(float));
+    cudaMalloc(&view.d_labels, elem_count * sizeof(int));
+    cudaMalloc(&view.d_row_indices, elem_count * sizeof(int));
+    
+    view.owns_memory = true;
+}
+
+void free_scratch_gpu_view(GPUDataview& view) {
+    if (view.d_values) cudaFree(view.d_values);
+    if (view.d_labels) cudaFree(view.d_labels);
+    if (view.d_row_indices) cudaFree(view.d_row_indices);
+    view.d_values = nullptr;
+    view.d_labels = nullptr;
+    view.d_row_indices = nullptr;
+}
+
+void allocate_int_buffer(int** buffer, size_t count) {
+    cudaMalloc((void**)buffer, count * sizeof(int));
+}
+
+void free_int_buffer(int* buffer) {
+    if (buffer) cudaFree(buffer);
+}
