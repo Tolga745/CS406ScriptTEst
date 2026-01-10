@@ -2,12 +2,13 @@
 #include <cuda_runtime.h>
 #include <iostream>
 #include <vector>
-#include <algorithm>
+#include <algorithm> // For std::max
 
 // --- CONSTANTS ---
 #define MAX_CLASSES 32 
 #define MAX_COUNTERS (MAX_CLASSES * 2)
 
+// --- GLOBAL DEFINITION ---
 GPUDataset global_gpu_dataset;
 
 // --- GPUDataset IMPLEMENTATION ---
@@ -62,6 +63,7 @@ void GPUDataset::initialize(const Dataset& cpu_dataset) {
     cudaMemcpy(d_original_indices, h_indices, total_elements * sizeof(int), cudaMemcpyHostToDevice);
 
     // Allocate GPU Memory (Buffers)
+    // d_assignment_buffer needs to handle the largest possible instance count (Root)
     cudaMalloc(&d_assignment_buffer, this->num_instances * sizeof(int));
     
     size_t int_bytes_feats = this->num_features * sizeof(int);
@@ -102,17 +104,20 @@ void GPUDataset::free() {
 
 // --- KERNELS ---
 
-// Kernel 1: Generate the Assignment Map (0=Left, 1=Right) for the current split
+// Kernel 1: Generate the Assignment Map (0=Left, 1=Right)
+// UPDATED: Now uses row_indices to write to the correct Original ID location
 __global__ void generate_assignment_map_kernel(
     const float* feature_column,
+    const int* row_indices,    // NEW: Needed to map sorted position to original row ID
     int* assignment_map,
     int num_instances,
     float threshold
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < num_instances) {
+        int row_id = row_indices[idx];
         // If value < threshold, go Left (0), else Right (1)
-        assignment_map[idx] = (feature_column[idx] < threshold) ? 0 : 1;
+        assignment_map[row_id] = (feature_column[idx] < threshold) ? 0 : 1;
     }
 }
 
@@ -129,7 +134,7 @@ __device__ int calculate_misclassification(int* counts, int num_classes, int tot
     return total_count - max_freq;
 }
 
-// Kernel 2: Compute Best Splits (The one you updated previously)
+// Kernel 2: Compute Best Splits
 __global__ void compute_splits_kernel(
     const float* __restrict__ values,
     const int* __restrict__ labels,
@@ -154,7 +159,6 @@ __global__ void compute_splits_kernel(
     int tid = threadIdx.x;
     int bdim = blockDim.x;
     
-    // Updated Offsets for physically contiguous memory
     int start_idx = feature_idx * num_instances;
     int count = num_instances;
 
@@ -170,8 +174,6 @@ __global__ void compute_splits_kernel(
     for (int i = my_start; i < my_end; ++i) {
         int global_idx = start_idx + i;
         
-        // Use row_indices to find which side (Left/Right) this row belongs to
-        // row_indices[global_idx] gives the local row ID (0..N-1)
         int row_id = row_indices[global_idx]; 
         int assignment = assignment_map[row_id]; 
         
@@ -182,7 +184,7 @@ __global__ void compute_splits_kernel(
     }
     __syncthreads();
 
-    // Hillis-Steele Scan
+    // Hillis-Steele Scan (Inclusive)
     for (int offset = 1; offset < bdim; offset *= 2) {
         int neighbor_vals[MAX_COUNTERS]; 
         bool has_neighbor = (tid >= offset);
@@ -196,6 +198,7 @@ __global__ void compute_splits_kernel(
         __syncthreads();
     }
 
+    // Prepare starting counts (Exclusive Scan) for Pass 2
     int my_starting_counts[MAX_COUNTERS]; 
     if (tid > 0) {
         for (int c = 0; c < num_counters_per_thread; ++c) my_starting_counts[c] = shared_counts[(tid - 1) * num_counters_per_thread + c];
@@ -203,13 +206,14 @@ __global__ void compute_splits_kernel(
         for(int c = 0; c < num_counters_per_thread; ++c) my_starting_counts[c] = 0;
     }
     
+    // Total Counts are in the last thread's shared memory
     __shared__ int total_counts[MAX_COUNTERS]; 
     if (tid == bdim - 1) {
         for (int c = 0; c < num_counters_per_thread; ++c) total_counts[c] = shared_counts[tid * num_counters_per_thread + c];
     }
     __syncthreads();
 
-    // Leaf Scores
+    // Leaf Scores (Only Thread 0 needs to compute this once per feature)
     if (tid == 0) {
         int total_L_size = 0; int total_R_size = 0;
         for(int c=0; c<num_classes; ++c) {
@@ -254,6 +258,7 @@ __global__ void compute_splits_kernel(
         
         if (value_changed && i > 0) { 
             float threshold = (prev_value + val) * 0.5f;
+            // Left Child Split Evaluation
             if (curr_L_size > 0 && curr_L_size < total_L_size) {
                 int l_lbl, r_lbl;
                 int score_L = calculate_misclassification(curr_counts_L, num_classes, curr_L_size, l_lbl);
@@ -263,6 +268,7 @@ __global__ void compute_splits_kernel(
                 int total_score = score_L + score_R;
                 if (total_score < local_best_score_L) { local_best_score_L = total_score; local_best_thresh_L = threshold; local_best_lL_L = l_lbl; local_best_lR_L = rem_lbl; local_best_cL_L = score_L; local_best_cR_L = score_R; }
             }
+            // Right Child Split Evaluation
             if (curr_R_size > 0 && curr_R_size < total_R_size) {
                 int l_lbl, r_lbl;
                 int score_L = calculate_misclassification(curr_counts_R, num_classes, curr_R_size, l_lbl);
@@ -278,6 +284,8 @@ __global__ void compute_splits_kernel(
         prev_value = val;
     }
 
+    // Parallel Reduction for Best Scores
+    // Reduce Left Score
     __syncthreads(); shared_counts[tid] = local_best_score_L; __syncthreads();
     if (tid == 0) {
         int best_score = leaf_scores_left[feature_idx]; int best_t = -1;
@@ -288,6 +296,8 @@ __global__ void compute_splits_kernel(
     if (shared_counts[0] != -1 && tid == shared_counts[0]) {
         best_thresholds_left[feature_idx] = local_best_thresh_L; best_labels_left_L[feature_idx] = local_best_lL_L; best_labels_left_R[feature_idx] = local_best_lR_L; best_child_scores_left_L[feature_idx] = local_best_cL_L; best_child_scores_left_R[feature_idx] = local_best_cR_L;
     }
+    
+    // Reduce Right Score
     __syncthreads(); shared_counts[tid] = local_best_score_R; __syncthreads();
     if (tid == 0) {
         int best_score = leaf_scores_right[feature_idx]; int best_t = -1;
@@ -311,11 +321,14 @@ void run_specialized_solver_gpu(
     int* h_best_scores_left, float* h_best_thresholds_left, int* h_best_labels_left_L, int* h_best_labels_left_R, int* h_best_child_scores_left_L, int* h_best_child_scores_left_R, int* h_leaf_scores_left, int* h_leaf_labels_left,
     int* h_best_scores_right, float* h_best_thresholds_right, int* h_best_labels_right_L, int* h_best_labels_right_R, int* h_best_child_scores_right_L, int* h_best_child_scores_right_R, int* h_leaf_scores_right, int* h_leaf_labels_right
 ) {
-    if (dataview.num_classes > MAX_CLASSES) { std::cerr << "ERR: Class limit exceeded" << std::endl; exit(1); }
+    if (dataview.num_classes > MAX_CLASSES) { std::cerr << \"ERR: Class limit exceeded\" << std::endl; exit(1); }
 
-    // 1. Allocate Temporary Assignment Map
-    int* d_assignment_map;
-    cudaMalloc(&d_assignment_map, dataview.num_instances * sizeof(int));
+    // PERFORMANCE FIX: Use Pre-allocated Buffers from global_gpu_dataset
+    // We assume global_gpu_dataset is initialized and large enough.
+    // The buffers in global_gpu_dataset are size `num_features` (of the whole dataset).
+    // The dataview might have the same number of features (vertical partition not supported yet), so indices match.
+
+    int* d_assignment_map = global_gpu_dataset.d_assignment_buffer; 
 
     // 2. Generate Assignments (Left/Right) for the specific split being evaluated
     int block = 256;
@@ -323,34 +336,25 @@ void run_specialized_solver_gpu(
     
     // Calculate pointer to the specific feature column for the split
     float* split_feature_col = dataview.d_values + (size_t)split_feature_index * dataview.num_instances;
+    
+    // CORRECTNESS FIX: Pass row_indices to map sorted position -> original ID
+    int* split_feature_row_indices = dataview.d_row_indices + (size_t)split_feature_index * dataview.num_instances;
 
     generate_assignment_map_kernel<<<grid, block>>>(
         split_feature_col,
+        split_feature_row_indices, // Fix
         d_assignment_map,
         dataview.num_instances,
         split_threshold
     );
 
     // 3. Run Solver
-    // Allocate device outputs
-    int num_feats = dataview.num_features;
-    size_t int_bytes = num_feats * sizeof(int); 
-    size_t float_bytes = num_feats * sizeof(float);
-    
-    // Note: For optimal performance, you should keep these buffers persistent in the class or a pool
-    // instead of allocating/freeing every time. For now, we allocate locally.
-    int *d_sL, *d_sR, *d_lblLL, *d_lblLR, *d_lblRL, *d_lblRR, *d_csLL, *d_csLR, *d_csRL, *d_csRR, *d_leafL, *d_leafR, *d_llblL, *d_llblR;
-    float *d_tL, *d_tR;
-    cudaMalloc(&d_sL, int_bytes); cudaMalloc(&d_sR, int_bytes);
-    cudaMalloc(&d_tL, float_bytes); cudaMalloc(&d_tR, float_bytes);
-    cudaMalloc(&d_lblLL, int_bytes); cudaMalloc(&d_lblLR, int_bytes); cudaMalloc(&d_lblRL, int_bytes); cudaMalloc(&d_lblRR, int_bytes);
-    cudaMalloc(&d_csLL, int_bytes); cudaMalloc(&d_csLR, int_bytes); cudaMalloc(&d_csRL, int_bytes); cudaMalloc(&d_csRR, int_bytes);
-    cudaMalloc(&d_leafL, int_bytes); cudaMalloc(&d_leafR, int_bytes);
-    cudaMalloc(&d_llblL, int_bytes); cudaMalloc(&d_llblR, int_bytes);
-
+    size_t int_bytes = dataview.num_features * sizeof(int); 
+    size_t float_bytes = dataview.num_features * sizeof(float);
     size_t shared_mem = (256 * dataview.num_classes * 2) * sizeof(int);
 
-    compute_splits_kernel<<<num_feats, 256, shared_mem>>>(
+    // Use Global Buffers (No cudaMalloc here!)
+    compute_splits_kernel<<<dataview.num_features, 256, shared_mem>>>(
         dataview.d_values,
         dataview.d_labels,
         dataview.d_row_indices,
@@ -358,33 +362,26 @@ void run_specialized_solver_gpu(
         dataview.num_features,
         dataview.num_instances,
         dataview.num_classes,
-        d_sL, d_tL, d_lblLL, d_lblLR, d_csLL, d_csLR, d_leafL, d_llblL,
-        d_sR, d_tR, d_lblRL, d_lblRR, d_csRL, d_csRR, d_leafR, d_llblR
+        global_gpu_dataset.d_score_L, global_gpu_dataset.d_thresh_L, global_gpu_dataset.d_lbl_L_L, global_gpu_dataset.d_lbl_L_R, global_gpu_dataset.d_cscore_L_L, global_gpu_dataset.d_cscore_L_R, global_gpu_dataset.d_leaf_L, global_gpu_dataset.d_leaflbl_L,
+        global_gpu_dataset.d_score_R, global_gpu_dataset.d_thresh_R, global_gpu_dataset.d_lbl_R_L, global_gpu_dataset.d_lbl_R_R, global_gpu_dataset.d_cscore_R_L, global_gpu_dataset.d_cscore_R_R, global_gpu_dataset.d_leaf_R, global_gpu_dataset.d_leaflbl_R
     );
 
     // 4. Copy Back
-    cudaMemcpy(h_best_scores_left, d_sL, int_bytes, cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_best_thresholds_left, d_tL, float_bytes, cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_best_labels_left_L, d_lblLL, int_bytes, cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_best_labels_left_R, d_lblLR, int_bytes, cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_best_child_scores_left_L, d_csLL, int_bytes, cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_best_child_scores_left_R, d_csLR, int_bytes, cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_leaf_scores_left, d_leafL, int_bytes, cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_leaf_labels_left, d_llblL, int_bytes, cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_best_scores_left, global_gpu_dataset.d_score_L, int_bytes, cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_best_thresholds_left, global_gpu_dataset.d_thresh_L, float_bytes, cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_best_labels_left_L, global_gpu_dataset.d_lbl_L_L, int_bytes, cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_best_labels_left_R, global_gpu_dataset.d_lbl_L_R, int_bytes, cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_best_child_scores_left_L, global_gpu_dataset.d_cscore_L_L, int_bytes, cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_best_child_scores_left_R, global_gpu_dataset.d_cscore_L_R, int_bytes, cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_leaf_scores_left, global_gpu_dataset.d_leaf_L, int_bytes, cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_leaf_labels_left, global_gpu_dataset.d_leaflbl_L, int_bytes, cudaMemcpyDeviceToHost);
 
-    cudaMemcpy(h_best_scores_right, d_sR, int_bytes, cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_best_thresholds_right, d_tR, float_bytes, cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_best_labels_right_L, d_lblRL, int_bytes, cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_best_labels_right_R, d_lblRR, int_bytes, cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_best_child_scores_right_L, d_csRL, int_bytes, cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_best_child_scores_right_R, d_csRR, int_bytes, cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_leaf_scores_right, d_leafR, int_bytes, cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_leaf_labels_right, d_llblR, int_bytes, cudaMemcpyDeviceToHost);
-
-    // 5. Cleanup
-    cudaFree(d_assignment_map);
-    cudaFree(d_sL); cudaFree(d_sR); cudaFree(d_tL); cudaFree(d_tR);
-    cudaFree(d_lblLL); cudaFree(d_lblLR); cudaFree(d_lblRL); cudaFree(d_lblRR);
-    cudaFree(d_csLL); cudaFree(d_csLR); cudaFree(d_csRL); cudaFree(d_csRR);
-    cudaFree(d_leafL); cudaFree(d_leafR); cudaFree(d_llblL); cudaFree(d_llblR);
+    cudaMemcpy(h_best_scores_right, global_gpu_dataset.d_score_R, int_bytes, cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_best_thresholds_right, global_gpu_dataset.d_thresh_R, float_bytes, cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_best_labels_right_L, global_gpu_dataset.d_lbl_R_L, int_bytes, cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_best_labels_right_R, global_gpu_dataset.d_lbl_R_R, int_bytes, cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_best_child_scores_right_L, global_gpu_dataset.d_cscore_R_L, int_bytes, cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_best_child_scores_right_R, global_gpu_dataset.d_cscore_R_R, int_bytes, cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_leaf_scores_right, global_gpu_dataset.d_leaf_R, int_bytes, cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_leaf_labels_right, global_gpu_dataset.d_leaflbl_R, int_bytes, cudaMemcpyDeviceToHost);
 }
