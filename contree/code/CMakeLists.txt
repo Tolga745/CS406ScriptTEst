@@ -46,6 +46,7 @@ file(GLOB SRC_FILES
     ${CMAKE_CURRENT_SOURCE_DIR}/main.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/DataStructures/src/dataset.cu
     ${CMAKE_CURRENT_SOURCE_DIR}/Engine/src/gpu_solver.cu
+    ${CMAKE_CURRENT_SOURCE_DIR}/DataStructures/src/dataset_transfer.cu
 )
 
 # Define include directories
