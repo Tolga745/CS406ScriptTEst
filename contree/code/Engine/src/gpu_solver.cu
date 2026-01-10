@@ -54,15 +54,15 @@ __device__ int calculate_misclassification(int* counts, int num_classes, int tot
 }
 
 __global__ void compute_splits_kernel(
-    const float* __restrict__ values,
-    const int* __restrict__ labels,
-    const int* __restrict__ original_indices,
-    const int* __restrict__ feature_offsets,
-    const int* __restrict__ active_mask, 
+    const float* __restrict__ values,       // GPUDataview.d_values
+    const int* __restrict__ labels,         // GPUDataview.d_labels
+    const int* __restrict__ row_indices,    // GPUDataview.d_data_point_indices (0..N-1)
+    const int* __restrict__ assignment_map, // The split assignments (0 for Left, 1 for Right)
     int num_features,
-    int num_instances,
+    int num_instances,                      // Size of the current GPUDataview
     int num_classes,
     
+    // Outputs (Size: num_features)
     int* best_scores_left, float* best_thresholds_left, int* best_labels_left_L, int* best_labels_left_R,
     int* best_child_scores_left_L, int* best_child_scores_left_R,
     int* leaf_scores_left, int* leaf_labels_left,
@@ -78,23 +78,29 @@ __global__ void compute_splits_kernel(
     int tid = threadIdx.x;
     int bdim = blockDim.x;
     
-    int start_idx = feature_offsets[feature_idx];
-    int end_idx = feature_offsets[feature_idx + 1];
-    int count = end_idx - start_idx;
+    // CHANGE 1: Calculate offsets based on compact GPUDataview structure
+    int start_idx = feature_idx * num_instances;
+    // int end_idx = start_idx + num_instances; // Not strictly needed, we use count
+    int count = num_instances;
 
     int chunk_size = (count + bdim - 1) / bdim;
     int my_start = tid * chunk_size;
     int my_end = min(my_start + chunk_size, count);
 
     int num_counters_per_thread = num_classes * 2;
+    // Initialize shared memory
     for (int i = 0; i < num_counters_per_thread; ++i) shared_counts[tid * num_counters_per_thread + i] = 0;
     __syncthreads();
 
     // PASS 1: Parallel Counting
     for (int i = my_start; i < my_end; ++i) {
         int global_idx = start_idx + i;
-        int orig_idx = original_indices[global_idx];
-        int assignment = active_mask[orig_idx]; // READS FROM CORRECT BUFFER
+        
+        // CHANGE 2: Use row_indices to look up the assignment map
+        // row_indices maps the sorted column position (i) to the dense row ID (0..N-1)
+        int row_id = row_indices[global_idx]; 
+        int assignment = assignment_map[row_id]; 
+        
         int label = labels[global_idx];
 
         if (assignment == 0) shared_counts[tid * num_counters_per_thread + label]++; 
@@ -102,7 +108,7 @@ __global__ void compute_splits_kernel(
     }
     __syncthreads();
 
-    // Hillis-Steele Scan
+    // Hillis-Steele Scan (Unchanged logic)
     for (int offset = 1; offset < bdim; offset *= 2) {
         int neighbor_vals[MAX_COUNTERS]; 
         bool has_neighbor = (tid >= offset);
@@ -129,7 +135,7 @@ __global__ void compute_splits_kernel(
     }
     __syncthreads();
 
-    // Leaf Scores (Thread 0)
+    // Leaf Scores (Thread 0) - Unchanged logic
     if (tid == 0) {
         int total_L_size = 0; int total_R_size = 0;
         for(int c=0; c<num_classes; ++c) {
@@ -143,7 +149,7 @@ __global__ void compute_splits_kernel(
     }
     __syncthreads();
 
-    // PASS 2: Split Finding
+    // PASS 2: Split Finding - Unchanged logic but uses updated offsets
     int local_best_score_L = 99999999; float local_best_thresh_L = 0.0f;
     int local_best_lL_L=0, local_best_lR_L=0, local_best_cL_L=-1, local_best_cR_L=-1;
     int local_best_score_R = 99999999; float local_best_thresh_R = 0.0f;
@@ -165,7 +171,11 @@ __global__ void compute_splits_kernel(
     for (int i = my_start; i < my_end; ++i) {
         int global_idx = start_idx + i;
         float val = values[global_idx];
-        int assignment = active_mask[original_indices[global_idx]];
+        
+        // CHANGE 3: Use row_indices again for assignment lookup
+        int row_id = row_indices[global_idx];
+        int assignment = assignment_map[row_id];
+        
         int label = labels[global_idx];
         bool value_changed = (val > prev_value + 1e-6f);
         
@@ -195,7 +205,7 @@ __global__ void compute_splits_kernel(
         prev_value = val;
     }
 
-    // Reduction
+    // Reduction - Unchanged logic
     __syncthreads(); shared_counts[tid] = local_best_score_L; __syncthreads();
     if (tid == 0) {
         int best_score = leaf_scores_left[feature_idx]; int best_t = -1;
