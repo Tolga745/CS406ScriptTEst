@@ -129,9 +129,6 @@ Dataview::Dataview(Dataset* sorted_dataset, Dataset* unsorted_dataset, int class
     }
 }
 
-Dataview::Dataview(int class_number, const bool sort_by_gini_index) 
-    : class_number(class_number), sort_by_gini_index(sort_by_gini_index) {
-}
 
 int Dataview::get_dataset_size() const {
     return int(feature_data[0].size());
