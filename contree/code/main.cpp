@@ -33,9 +33,10 @@ void create_optimal_decision_tree(std::string file_name, int run_number, Configu
 
         sorted_dataset.sort_feature_values();
 
+        global_gpu_dataset.initialize(sorted_dataset);
+
         Dataview dataview = Dataview(&sorted_dataset, &unsorted_dataset, class_number, config.sort_gini);
 
-        global_gpu_dataset.initialize(sorted_dataset);
 
         optimal_decision_tree = std::make_shared<Tree>();
         int max_gap = config.max_gap;
