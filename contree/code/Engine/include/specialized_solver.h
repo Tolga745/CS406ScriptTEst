@@ -16,6 +16,25 @@
 
 class Depth1ScoreHelper;
 
+struct SolverBuffers {
+    std::vector<int> left_scores, left_labels_L, left_labels_R, left_child_scores_L, left_child_scores_R, left_leaf_scores, left_leaf_labels;
+    std::vector<float> left_thresholds;
+    std::vector<int> right_scores, right_labels_L, right_labels_R, right_child_scores_L, right_child_scores_R, right_leaf_scores, right_leaf_labels;
+    std::vector<float> right_thresholds;
+
+    void resize(int num_features) {
+        if (left_scores.size() != num_features) {
+            left_scores.resize(num_features); left_labels_L.resize(num_features); left_labels_R.resize(num_features);
+            left_child_scores_L.resize(num_features); left_child_scores_R.resize(num_features); left_leaf_scores.resize(num_features); left_leaf_labels.resize(num_features);
+            left_thresholds.resize(num_features);
+            
+            right_scores.resize(num_features); right_labels_L.resize(num_features); right_labels_R.resize(num_features);
+            right_child_scores_L.resize(num_features); right_child_scores_R.resize(num_features); right_leaf_scores.resize(num_features); right_leaf_labels.resize(num_features);
+            right_thresholds.resize(num_features);
+        }
+    }
+};
+
 class SpecializedSolver {
 public:
     /**
@@ -30,6 +49,9 @@ public:
      */
     static void create_optimal_decision_tree(const Dataview& dataset, const Configuration& solution_config, std::shared_ptr<Tree>& current_optimal_tree, int upper_bound);
 
+    static void create_optimal_decision_tree(const Dataview& dataview, const Configuration& solution_configuration, int feature_index, std::shared_ptr<Tree> &current_optimal_decision_tree, int upper_bound, SolverBuffers& buffers);
+
+    static void get_best_left_right_scores(const Dataview& dataview, int feature_index, int split_point, float threshold, std::shared_ptr<Tree> &left_optimal_dt, std::shared_ptr<Tree> &right_optimal_dt, int upper_bound, SolverBuffers& buffers);
 private:
     /**
      * Creates the optimal decision tree for the given dataset, solution configuration and the first feature to split on.
