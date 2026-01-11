@@ -4,6 +4,7 @@
 #include <thrust/execution_policy.h>
 #include <thrust/iterator/zip_iterator.h>
 #include <thrust/tuple.h>
+#include <iostream>
 
 // Predicate to decide direction based on the Row Map
 // The input is a tuple: <value, label, original_index, unique_index> (or subset)
@@ -40,6 +41,12 @@ __global__ void mark_split_indices_kernel(
 
 void split_gpu_dataview(const GPUDataview& parent, GPUDataview& left, GPUDataview& right, int split_feat_idx, float threshold, cudaStream_t stream) {
     // 1. Setup metadata
+
+    static int call_counter = 0;
+    call_counter++;
+    if(call_counter % 100 == 0) {
+        std::cout << "[DEBUG] split_gpu_dataview called " << call_counter << " times. (Heavy GPU Alloc)" << std::endl;
+    }
     left.num_features = parent.num_features; left.num_classes = parent.num_classes;
     left.owns_memory = true;
 
