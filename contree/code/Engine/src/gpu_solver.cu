@@ -1,4 +1,5 @@
 #include "gpu_solver.cuh"
+#include "dataview.h"
 #include <cuda_runtime.h>
 #include <iostream>
 #include <vector>
@@ -355,7 +356,7 @@ __global__ void compute_splits_kernel(
 
 // --- UNIFIED LAUNCHER ---
 void run_specialized_solver_gpu(
-    const GPUDataview& dataview,
+    const Dataview& dataview, // Changed signature
     int split_feature_index,
     float split_threshold,
     int upper_bound,
@@ -364,47 +365,82 @@ void run_specialized_solver_gpu(
     int* h_best_scores_left, float* h_best_thresholds_left, int* h_best_labels_left_L, int* h_best_labels_left_R, int* h_best_child_scores_left_L, int* h_best_child_scores_left_R, int* h_leaf_scores_left, int* h_leaf_labels_left,
     int* h_best_scores_right, float* h_best_thresholds_right, int* h_best_labels_right_L, int* h_best_labels_right_R, int* h_best_child_scores_right_L, int* h_best_child_scores_right_R, int* h_leaf_scores_right, int* h_leaf_labels_right
 ) {
-    if (dataview.num_classes > MAX_CLASSES) { std::cerr << "ERR: Class limit exceeded" << std::endl; exit(1); }
+    // --- JIT DATA UPLOAD LOGIC ---
+    GPUDataview active_view = dataview.gpu_view;
 
-    // PERFORMANCE FIX: Use Pre-allocated Buffers from global_gpu_dataset
-    // We assume global_gpu_dataset is initialized and large enough.
-    // The buffers in global_gpu_dataset are size `num_features` (of the whole dataset).
-    // The dataview might have the same number of features (vertical partition not supported yet), so indices match.
+    // If GPU data is missing (because we disabled recursive splitting), upload it now.
+    if (active_view.d_values == nullptr) {
+        // Use recursion_buffers[0] as scratch space (SpecializedSolver is a leaf process)
+        // We assume recursion_buffers are allocated large enough (Root size).
+        auto& buffer = recursion_buffers[0];
+        
+        int num_instances = dataview.get_dataset_size();
+        int num_features = dataview.get_feature_number();
+        size_t total_elements = (size_t)num_instances * num_features;
+
+        // Flatten CPU data into Host Buffers
+        std::vector<float> h_val(total_elements);
+        std::vector<int> h_lbl(total_elements);
+        std::vector<int> h_idx(total_elements);
+
+        size_t global_idx = 0;
+        for (int f = 0; f < num_features; f++) {
+            const auto& feat_vec = dataview.get_sorted_dataset_feature(f);
+            for (const auto& elem : feat_vec) {
+                h_val[global_idx] = elem.value;
+                h_lbl[global_idx] = elem.label;
+                h_idx[global_idx] = elem.data_point_index;
+                global_idx++;
+            }
+        }
+
+        // Upload to GPU (Reuse recursion buffer)
+        cudaMemcpy(buffer.d_values, h_val.data(), total_elements * sizeof(float), cudaMemcpyHostToDevice);
+        cudaMemcpy(buffer.d_labels, h_lbl.data(), total_elements * sizeof(int), cudaMemcpyHostToDevice);
+        cudaMemcpy(buffer.d_row_indices, h_idx.data(), total_elements * sizeof(int), cudaMemcpyHostToDevice);
+
+        // Setup temporary view
+        active_view.d_values = buffer.d_values;
+        active_view.d_labels = buffer.d_labels;
+        active_view.d_row_indices = buffer.d_row_indices;
+        active_view.num_instances = num_instances;
+        active_view.num_features = num_features;
+        active_view.num_classes = dataview.get_class_number();
+    }
+    // -----------------------------
+
+    if (active_view.num_classes > MAX_CLASSES) { std::cerr << "ERR: Class limit exceeded" << std::endl; exit(1); }
 
     int* d_assignment_map = global_gpu_dataset.d_assignment_buffer; 
 
-    // 2. Generate Assignments (Left/Right) for the specific split being evaluated
+    // 2. Generate Assignments
     int block = 256;
-    int grid = (dataview.num_instances + block - 1) / block;
+    int grid = (active_view.num_instances + block - 1) / block;
     
-    // Calculate pointer to the specific feature column for the split
-    float* split_feature_col = dataview.d_values + (size_t)split_feature_index * dataview.num_instances;
-    
-    // CORRECTNESS FIX: Pass row_indices to map sorted position -> original ID
-    int* split_feature_row_indices = dataview.d_row_indices + (size_t)split_feature_index * dataview.num_instances;
+    float* split_feature_col = active_view.d_values + (size_t)split_feature_index * active_view.num_instances;
+    int* split_feature_row_indices = active_view.d_row_indices + (size_t)split_feature_index * active_view.num_instances;
 
     generate_assignment_map_kernel<<<grid, block>>>(
         split_feature_col,
-        split_feature_row_indices, // Fix
+        split_feature_row_indices, 
         d_assignment_map,
-        dataview.num_instances,
+        active_view.num_instances,
         split_threshold
     );
 
     // 3. Run Solver
-    size_t int_bytes = dataview.num_features * sizeof(int); 
-    size_t float_bytes = dataview.num_features * sizeof(float);
-    size_t shared_mem = (256 * dataview.num_classes * 2) * sizeof(int);
+    size_t int_bytes = active_view.num_features * sizeof(int); 
+    size_t float_bytes = active_view.num_features * sizeof(float);
+    size_t shared_mem = (256 * active_view.num_classes * 2) * sizeof(int);
 
-    // Use Global Buffers (No cudaMalloc here!)
-    compute_splits_kernel<<<dataview.num_features, 256, shared_mem>>>(
-        dataview.d_values,
-        dataview.d_labels,
-        dataview.d_row_indices,
+    compute_splits_kernel<<<active_view.num_features, 256, shared_mem>>>(
+        active_view.d_values,
+        active_view.d_labels,
+        active_view.d_row_indices,
         d_assignment_map,
-        dataview.num_features,
-        dataview.num_instances,
-        dataview.num_classes,
+        active_view.num_features,
+        active_view.num_instances,
+        active_view.num_classes,
         global_gpu_dataset.d_score_L, global_gpu_dataset.d_thresh_L, global_gpu_dataset.d_lbl_L_L, global_gpu_dataset.d_lbl_L_R, global_gpu_dataset.d_cscore_L_L, global_gpu_dataset.d_cscore_L_R, global_gpu_dataset.d_leaf_L, global_gpu_dataset.d_leaflbl_L,
         global_gpu_dataset.d_score_R, global_gpu_dataset.d_thresh_R, global_gpu_dataset.d_lbl_R_L, global_gpu_dataset.d_lbl_R_R, global_gpu_dataset.d_cscore_R_L, global_gpu_dataset.d_cscore_R_R, global_gpu_dataset.d_leaf_R, global_gpu_dataset.d_leaflbl_R
     );

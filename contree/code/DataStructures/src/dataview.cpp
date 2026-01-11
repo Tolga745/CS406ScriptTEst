@@ -308,12 +308,13 @@ void Dataview::split_data_points(const Dataview& current_dataview, int feature_i
     }
 
     // If the parent has GPU data, split it for children
+    /* // COMMENTED OUT TO PREVENT GPU THRASHING
     if (current_dataview.gpu_view.d_values != nullptr) {
-        float threshold = current_feature[split_point].value; // Value at split boundary (Right starts here)
-
+        float threshold = current_feature[split_point].value; 
         int buffer_idx = (current_max_depth > 0) ? (current_max_depth - 1) : 0;
         split_gpu_dataview(current_dataview.gpu_view, left_dataview.gpu_view, right_dataview.gpu_view, feature_index, threshold, buffer_idx);
     }
+    */
 }
 
 void Dataview::initialize_split_parameters(const std::vector<Dataset::FeatureElement>& current_feature, int class_number, const std::vector<int> &current_label_frequency, int split_point, std::vector<int> &left_label_frequency, std::vector<int> &right_label_frequency) {

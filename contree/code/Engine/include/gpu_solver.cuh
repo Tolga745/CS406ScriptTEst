@@ -47,7 +47,7 @@ extern GPUDataset global_gpu_dataset;
 
 
 void run_specialized_solver_gpu(
-    const GPUDataview& dataview,
+    const Dataview& dataview,
     int split_feature_index,
     float split_threshold,
     int upper_bound,
