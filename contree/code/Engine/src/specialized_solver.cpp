@@ -23,7 +23,7 @@ void SpecializedSolver::get_best_left_right_scores(const Dataview& dataview, int
     
     // Call Unified GPU Solver using pointers from the buffer
     run_specialized_solver_gpu(
-        dataview.gpu_view,
+        dataview, 
         feature_index, 
         threshold, 
         upper_bound,
