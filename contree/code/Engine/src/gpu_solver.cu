@@ -286,9 +286,16 @@ __global__ void compute_splits_kernel(
     int total_L_size = 0; for(int c=0; c<num_classes; ++c) total_L_size += total_counts[c];
     int total_R_size = 0; for(int c=0; c<num_classes; ++c) total_R_size += total_counts[num_classes+c];
 
-    float prev_value = -999999.0f;
-    if (my_start > 0) prev_value = values[start_idx + my_start - 1];
-    else if (count > 0 && my_start == 0) prev_value = values[start_idx];
+    float prev_value = -1e30f; // Sentinel
+    bool has_prev = false;
+
+    if (my_start > 0) {
+        prev_value = values[start_idx + my_start - 1];
+        has_prev = true;
+    } else if (count > 0 && my_start == 0) {
+        prev_value = values[start_idx];
+        has_prev = true;
+    }
 
     for (int i = my_start; i < my_end; ++i) {
         int global_idx = start_idx + i;
@@ -298,7 +305,7 @@ __global__ void compute_splits_kernel(
         int assignment = assignment_map[row_id];
         
         int label = labels[global_idx];
-        bool value_changed = (val > prev_value + 1e-6f);
+        bool value_changed = has_prev && (val > prev_value);
         
         if (value_changed && i > 0) { 
             float threshold = (prev_value + val) * 0.5f;
