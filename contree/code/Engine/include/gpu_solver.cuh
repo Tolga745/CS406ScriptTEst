@@ -46,9 +46,11 @@ struct GPUDataset {
 
 extern GPUDataset global_gpu_dataset;
 
+void prepare_gpu_view(const Dataview& cpu_view, GPUDataview& gpu_view);
+
 
 void run_specialized_solver_gpu(
-    const Dataview& dataview,
+    const GPUDataview& dataview,
     int split_feature_index,
     float split_threshold,
     int upper_bound,

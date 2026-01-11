@@ -13,6 +13,7 @@
 #include "specialized_solver.h"
 #include "statistics.h"
 #include "tree.h"
+#include "gpu_structs.h"
 
 class Depth1ScoreHelper;
 
@@ -49,9 +50,9 @@ public:
      */
     static void create_optimal_decision_tree(const Dataview& dataset, const Configuration& solution_config, std::shared_ptr<Tree>& current_optimal_tree, int upper_bound);
 
-    static void create_optimal_decision_tree(const Dataview& dataview, const Configuration& solution_configuration, int feature_index, std::shared_ptr<Tree> &current_optimal_decision_tree, int upper_bound, SolverBuffers& buffers);
+    static void create_optimal_decision_tree(const Dataview& dataview, const GPUDataview& gpu_view, const Configuration& solution_configuration, int feature_index, std::shared_ptr<Tree> &current_optimal_decision_tree, int upper_bound, SolverBuffers& buffers);
 
-    static void get_best_left_right_scores(const Dataview& dataview, int feature_index, int split_point, float threshold, std::shared_ptr<Tree> &left_optimal_dt, std::shared_ptr<Tree> &right_optimal_dt, int upper_bound, SolverBuffers& buffers);
+    static void get_best_left_right_scores(const Dataview& dataview, const GPUDataview& gpu_view, int feature_index, int split_point, float threshold, std::shared_ptr<Tree> &left_optimal_dt, std::shared_ptr<Tree> &right_optimal_dt, int upper_bound, SolverBuffers& buffers);
 private:
     /**
      * Creates the optimal decision tree for the given dataset, solution configuration and the first feature to split on.

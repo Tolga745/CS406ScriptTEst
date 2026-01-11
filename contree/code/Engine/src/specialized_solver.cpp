@@ -4,11 +4,17 @@
 
 void SpecializedSolver::create_optimal_decision_tree(const Dataview& dataview, const Configuration& solution_configuration, std::shared_ptr<Tree>& current_optimal_decision_tree, int upper_bound) {
     
+    // --- JIT UPLOAD (ONCE) ---
+    GPUDataview active_gpu_view = dataview.gpu_view;
+    prepare_gpu_view(dataview, active_gpu_view); // Ensures data is on GPU (uploaded if needed)
+    // -------------------------
+
     SolverBuffers buffers;
     buffers.resize(dataview.get_feature_number());
     
     for (int feature_index = 0; feature_index < dataview.get_feature_number(); feature_index++) {
-        create_optimal_decision_tree(dataview, solution_configuration, feature_index, current_optimal_decision_tree, std::min(upper_bound, current_optimal_decision_tree->misclassification_score), buffers);
+        // Pass the prepared view down
+        create_optimal_decision_tree(dataview, active_gpu_view, solution_configuration, feature_index, current_optimal_decision_tree, std::min(upper_bound, current_optimal_decision_tree->misclassification_score), buffers);
 
         if (current_optimal_decision_tree->misclassification_score <= solution_configuration.max_gap) {
             return;
@@ -16,14 +22,14 @@ void SpecializedSolver::create_optimal_decision_tree(const Dataview& dataview, c
     }
 }
 
-void SpecializedSolver::get_best_left_right_scores(const Dataview& dataview, int feature_index, int split_point, float threshold, std::shared_ptr<Tree> &left_optimal_dt, std::shared_ptr<Tree> &right_optimal_dt, int upper_bound, SolverBuffers& buffers) {
+void SpecializedSolver::get_best_left_right_scores(const Dataview& dataview, const GPUDataview& gpu_view, int feature_index, int split_point, float threshold, std::shared_ptr<Tree> &left_optimal_dt, std::shared_ptr<Tree> &right_optimal_dt, int upper_bound, SolverBuffers& buffers) {
     int num_features = dataview.get_feature_number();
     
     // NO LOCAL ALLOCATION HERE! We use 'buffers'.
     
     // Call Unified GPU Solver using pointers from the buffer
     run_specialized_solver_gpu(
-        dataview, 
+        gpu_view, 
         feature_index, 
         threshold, 
         upper_bound,
@@ -74,7 +80,7 @@ void SpecializedSolver::get_best_left_right_scores(const Dataview& dataview, int
 
 
 
-void SpecializedSolver::create_optimal_decision_tree(const Dataview& dataview, const Configuration& solution_configuration, int feature_index, std::shared_ptr<Tree> &current_optimal_decision_tree, int upper_bound, SolverBuffers& buffers) {
+void SpecializedSolver::create_optimal_decision_tree(const Dataview& dataview, const GPUDataview& gpu_view, const Configuration& solution_configuration, int feature_index, std::shared_ptr<Tree> &current_optimal_decision_tree, int upper_bound, SolverBuffers& buffers) {
     const std::vector<Dataset::FeatureElement>& current_feature = dataview.get_sorted_dataset_feature(feature_index);
 
     const auto& possible_split_indices = dataview.get_possible_split_indices(feature_index);
@@ -107,8 +113,8 @@ void SpecializedSolver::create_optimal_decision_tree(const Dataview& dataview, c
 
         statistics::total_number_of_specialized_solver_calls += 1;
         
-        // --- PASS BUFFERS HERE ---
-        get_best_left_right_scores(dataview, feature_index, split_point, threshold, left_optimal_dt, right_optimal_dt, current_optimal_decision_tree->misclassification_score, buffers);
+        // Pass gpu_view down
+        get_best_left_right_scores(dataview, gpu_view, feature_index, split_point, threshold, left_optimal_dt, right_optimal_dt, current_optimal_decision_tree->misclassification_score, buffers);
         
         const int current_best_score = left_optimal_dt->misclassification_score + right_optimal_dt->misclassification_score;
 

@@ -354,9 +354,51 @@ __global__ void compute_splits_kernel(
     }
 }
 
+void prepare_gpu_view(const Dataview& cpu_view, GPUDataview& gpu_view) {
+    // If we already have a valid pointer, do nothing.
+    if (gpu_view.d_values != nullptr) return;
+
+    // Use recursion_buffers[0] as scratch space
+    auto& buffer = recursion_buffers[0];
+    
+    int num_instances = cpu_view.get_dataset_size();
+    int num_features = cpu_view.get_feature_number();
+    size_t total_elements = (size_t)num_instances * num_features;
+
+    // Flatten CPU data
+    std::vector<float> h_val(total_elements);
+    std::vector<int> h_lbl(total_elements);
+    std::vector<int> h_idx(total_elements);
+
+    size_t global_idx = 0;
+    for (int f = 0; f < num_features; f++) {
+        const auto& feat_vec = cpu_view.get_sorted_dataset_feature(f);
+        for (const auto& elem : feat_vec) {
+            h_val[global_idx] = elem.value;
+            h_lbl[global_idx] = elem.label;
+            h_idx[global_idx] = elem.data_point_index;
+            global_idx++;
+        }
+    }
+
+    // Upload
+    cudaMemcpy(buffer.d_values, h_val.data(), total_elements * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(buffer.d_labels, h_lbl.data(), total_elements * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(buffer.d_row_indices, h_idx.data(), total_elements * sizeof(int), cudaMemcpyHostToDevice);
+
+    // Set GPU View
+    gpu_view.d_values = buffer.d_values;
+    gpu_view.d_labels = buffer.d_labels;
+    gpu_view.d_row_indices = buffer.d_row_indices;
+    gpu_view.num_instances = num_instances;
+    gpu_view.num_features = num_features;
+    gpu_view.num_classes = cpu_view.get_class_number();
+    gpu_view.owns_memory = false; 
+}
+
 // --- UNIFIED LAUNCHER ---
 void run_specialized_solver_gpu(
-    const Dataview& dataview, // Changed signature
+    const GPUDataview& active_view, // Takes PREPARED view
     int split_feature_index,
     float split_threshold,
     int upper_bound,
@@ -365,50 +407,6 @@ void run_specialized_solver_gpu(
     int* h_best_scores_left, float* h_best_thresholds_left, int* h_best_labels_left_L, int* h_best_labels_left_R, int* h_best_child_scores_left_L, int* h_best_child_scores_left_R, int* h_leaf_scores_left, int* h_leaf_labels_left,
     int* h_best_scores_right, float* h_best_thresholds_right, int* h_best_labels_right_L, int* h_best_labels_right_R, int* h_best_child_scores_right_L, int* h_best_child_scores_right_R, int* h_leaf_scores_right, int* h_leaf_labels_right
 ) {
-    // --- JIT DATA UPLOAD LOGIC ---
-    GPUDataview active_view = dataview.gpu_view;
-
-    // If GPU data is missing (because we disabled recursive splitting), upload it now.
-    if (active_view.d_values == nullptr) {
-        // Use recursion_buffers[0] as scratch space (SpecializedSolver is a leaf process)
-        // We assume recursion_buffers are allocated large enough (Root size).
-        auto& buffer = recursion_buffers[0];
-        
-        int num_instances = dataview.get_dataset_size();
-        int num_features = dataview.get_feature_number();
-        size_t total_elements = (size_t)num_instances * num_features;
-
-        // Flatten CPU data into Host Buffers
-        std::vector<float> h_val(total_elements);
-        std::vector<int> h_lbl(total_elements);
-        std::vector<int> h_idx(total_elements);
-
-        size_t global_idx = 0;
-        for (int f = 0; f < num_features; f++) {
-            const auto& feat_vec = dataview.get_sorted_dataset_feature(f);
-            for (const auto& elem : feat_vec) {
-                h_val[global_idx] = elem.value;
-                h_lbl[global_idx] = elem.label;
-                h_idx[global_idx] = elem.data_point_index;
-                global_idx++;
-            }
-        }
-
-        // Upload to GPU (Reuse recursion buffer)
-        cudaMemcpy(buffer.d_values, h_val.data(), total_elements * sizeof(float), cudaMemcpyHostToDevice);
-        cudaMemcpy(buffer.d_labels, h_lbl.data(), total_elements * sizeof(int), cudaMemcpyHostToDevice);
-        cudaMemcpy(buffer.d_row_indices, h_idx.data(), total_elements * sizeof(int), cudaMemcpyHostToDevice);
-
-        // Setup temporary view
-        active_view.d_values = buffer.d_values;
-        active_view.d_labels = buffer.d_labels;
-        active_view.d_row_indices = buffer.d_row_indices;
-        active_view.num_instances = num_instances;
-        active_view.num_features = num_features;
-        active_view.num_classes = dataview.get_class_number();
-    }
-    // -----------------------------
-
     if (active_view.num_classes > MAX_CLASSES) { std::cerr << "ERR: Class limit exceeded" << std::endl; exit(1); }
 
     int* d_assignment_map = global_gpu_dataset.d_assignment_buffer; 
