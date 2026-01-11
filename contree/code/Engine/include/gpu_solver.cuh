@@ -5,6 +5,7 @@
 #include "dataset.h"
 #include "gpu_structs.h"
 
+class Dataview;
 
 struct GPURecursionBuffer {
     float* d_values = nullptr;
