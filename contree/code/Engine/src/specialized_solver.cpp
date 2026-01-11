@@ -29,50 +29,65 @@ void SpecializedSolver::get_best_left_right_scores(const Dataview& dataview, con
     
     // Call Unified GPU Solver using pointers from the buffer
     run_specialized_solver_gpu(
-        gpu_view, 
-        feature_index, 
-        threshold, 
-        upper_bound,
+        gpu_view, feature_index, threshold, upper_bound,
         buffers.left_scores.data(), buffers.left_thresholds.data(), buffers.left_labels_L.data(), buffers.left_labels_R.data(), buffers.left_child_scores_L.data(), buffers.left_child_scores_R.data(), buffers.left_leaf_scores.data(), buffers.left_leaf_labels.data(),
-        buffers.right_scores.data(), buffers.right_thresholds.data(), buffers.right_labels_L.data(), buffers.right_labels_R.data(), buffers.right_child_scores_L.data(), buffers.right_child_scores_R.data(), buffers.right_leaf_scores.data(), buffers.right_leaf_labels.data()
+        buffers.right_scores.data(), buffers.right_thresholds.data(), buffers.right_labels_L.data(), buffers.right_labels_R.data(), buffers.right_child_scores_L.data(), buffers.right_child_scores_R.data(), buffers.right_leaf_scores.data(), buffers.right_leaf_labels.data(),
+        false // FETCH FULL RESULTS = FALSE
     );
 
-    // Process Left Results
+    bool potential_improvement = false;
+
     int best_L_idx = -1;
     for(int i=0; i<num_features; ++i) {
-        if(best_L_idx == -1 || buffers.left_scores[i] < buffers.left_scores[best_L_idx]) {
-            best_L_idx = i;
-        }
+        if(best_L_idx == -1 || buffers.left_scores[i] < buffers.left_scores[best_L_idx]) best_L_idx = i;
     }
-    
-    int leaf_score_L = buffers.left_leaf_scores[0]; 
-    if (best_L_idx != -1 && buffers.left_scores[best_L_idx] < leaf_score_L) {
-        left_optimal_dt->misclassification_score = buffers.left_scores[best_L_idx];
-        left_optimal_dt->update_split(
-            best_L_idx, buffers.left_thresholds[best_L_idx], 
-            std::make_shared<Tree>(buffers.left_labels_L[best_L_idx], buffers.left_child_scores_L[best_L_idx]), 
-            std::make_shared<Tree>(buffers.left_labels_R[best_L_idx], buffers.left_child_scores_R[best_L_idx])
+    int best_score_L = (best_L_idx != -1 && buffers.left_scores[best_L_idx] < buffers.left_leaf_scores[0]) 
+                        ? buffers.left_scores[best_L_idx] : buffers.left_leaf_scores[0];
+
+    // Check Right
+    int best_R_idx = -1;
+    for(int i=0; i<num_features; ++i) {
+        if(best_R_idx == -1 || buffers.right_scores[i] < buffers.right_scores[best_R_idx]) best_R_idx = i;
+    }
+    int best_score_R = (best_R_idx != -1 && buffers.right_scores[best_R_idx] < buffers.right_leaf_scores[0])
+                        ? buffers.right_scores[best_R_idx] : buffers.right_leaf_scores[0];
+
+    // If combined score beats upper bound, we MUST fetch details to construct the tree
+    if (best_score_L + best_score_R < upper_bound) {
+        potential_improvement = true;
+    }
+
+    // 3. SLOW PASS: If promising, fetch everything
+    if (potential_improvement) {
+        run_specialized_solver_gpu(
+            gpu_view, feature_index, threshold, upper_bound,
+            buffers.left_scores.data(), buffers.left_thresholds.data(), buffers.left_labels_L.data(), buffers.left_labels_R.data(), buffers.left_child_scores_L.data(), buffers.left_child_scores_R.data(), buffers.left_leaf_scores.data(), buffers.left_leaf_labels.data(),
+            buffers.right_scores.data(), buffers.right_thresholds.data(), buffers.right_labels_L.data(), buffers.right_labels_R.data(), buffers.right_child_scores_L.data(), buffers.right_child_scores_R.data(), buffers.right_leaf_scores.data(), buffers.right_leaf_labels.data(),
+            true // FETCH FULL RESULTS = TRUE
         );
+    }
+
+    // 4. Construct Result (Existing Logic)
+    // Left
+    best_L_idx = -1; // Re-find to be safe (or reuse)
+    for(int i=0; i<num_features; ++i) { if(best_L_idx == -1 || buffers.left_scores[i] < buffers.left_scores[best_L_idx]) best_L_idx = i; }
+    int leaf_score_L = buffers.left_leaf_scores[0]; 
+
+    if (potential_improvement && best_L_idx != -1 && buffers.left_scores[best_L_idx] < leaf_score_L) {
+        left_optimal_dt->misclassification_score = buffers.left_scores[best_L_idx];
+        left_optimal_dt->update_split(best_L_idx, buffers.left_thresholds[best_L_idx], std::make_shared<Tree>(buffers.left_labels_L[best_L_idx], buffers.left_child_scores_L[best_L_idx]), std::make_shared<Tree>(buffers.left_labels_R[best_L_idx], buffers.left_child_scores_R[best_L_idx]));
     } else {
         left_optimal_dt->make_leaf(buffers.left_leaf_labels[0], leaf_score_L);
     }
 
-    // Process Right Results
-    int best_R_idx = -1;
-    for(int i=0; i<num_features; ++i) {
-        if(best_R_idx == -1 || buffers.right_scores[i] < buffers.right_scores[best_R_idx]) {
-            best_R_idx = i;
-        }
-    }
-
+    // Right
+    best_R_idx = -1;
+    for(int i=0; i<num_features; ++i) { if(best_R_idx == -1 || buffers.right_scores[i] < buffers.right_scores[best_R_idx]) best_R_idx = i; }
     int leaf_score_R = buffers.right_leaf_scores[0];
-    if (best_R_idx != -1 && buffers.right_scores[best_R_idx] < leaf_score_R) {
+
+    if (potential_improvement && best_R_idx != -1 && buffers.right_scores[best_R_idx] < leaf_score_R) {
         right_optimal_dt->misclassification_score = buffers.right_scores[best_R_idx];
-        right_optimal_dt->update_split(
-            best_R_idx, buffers.right_thresholds[best_R_idx], 
-            std::make_shared<Tree>(buffers.right_labels_L[best_R_idx], buffers.right_child_scores_L[best_R_idx]), 
-            std::make_shared<Tree>(buffers.right_labels_R[best_R_idx], buffers.right_child_scores_R[best_R_idx])
-        );
+        right_optimal_dt->update_split(best_R_idx, buffers.right_thresholds[best_R_idx], std::make_shared<Tree>(buffers.right_labels_L[best_R_idx], buffers.right_child_scores_L[best_R_idx]), std::make_shared<Tree>(buffers.right_labels_R[best_R_idx], buffers.right_child_scores_R[best_R_idx]));
     } else {
         right_optimal_dt->make_leaf(buffers.right_leaf_labels[0], leaf_score_R);
     }
