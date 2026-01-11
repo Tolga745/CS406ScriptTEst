@@ -142,19 +142,24 @@ __global__ void mark_split_indices_kernel(const float* feature_values, const int
 }
 
 void split_gpu_dataview(const GPUDataview& parent, GPUDataview& left, GPUDataview& right, int split_feat_idx, float threshold, int child_depth, cudaStream_t stream) {
+    static int pool_hits = 0;
+    static int pool_misses = 0;
+    static int calls = 0;
+
     left.num_features = parent.num_features; left.num_classes = parent.num_classes;
     right.num_features = parent.num_features; right.num_classes = parent.num_classes;
 
     // 1. Memory Management (Pool)
     bool use_pool = (child_depth < recursion_buffers.size());
     if (use_pool) {
+        pool_hits++;
         auto& buffer = recursion_buffers[child_depth];
         left.d_values = buffer.d_values; left.d_labels = buffer.d_labels; left.d_row_indices = buffer.d_row_indices;
         size_t left_sz = (size_t)left.num_instances * left.num_features;
         right.d_values = buffer.d_values + left_sz; right.d_labels = buffer.d_labels + left_sz; right.d_row_indices = buffer.d_row_indices + left_sz;
         left.owns_memory = false; right.owns_memory = false;
     } else {
-        // Fallback for extreme depths (should be rare)
+        pool_misses++;
         size_t l_sz = (size_t)left.num_instances * left.num_features;
         size_t r_sz = (size_t)right.num_instances * right.num_features;
         cudaMalloc(&left.d_values, l_sz * sizeof(float)); cudaMalloc(&left.d_labels, l_sz * sizeof(int)); cudaMalloc(&left.d_row_indices, l_sz * sizeof(int));
@@ -162,10 +167,19 @@ void split_gpu_dataview(const GPUDataview& parent, GPUDataview& left, GPUDatavie
         left.owns_memory = true; right.owns_memory = true;
     }
 
+    // DEBUG OUTPUT every 1000 calls
+    if (++calls % 1000 == 0) {
+        std::cout << "[GPU MEM] Calls: " << calls 
+                  << " | Pool Hits: " << pool_hits 
+                  << " | Pool Misses (Malloc): " << pool_misses 
+                  << " | Depth: " << child_depth 
+                  << " | BufferSize: " << recursion_buffers.size() << std::endl;
+    }
+
     int* d_row_map_ptr = use_pool ? d_global_row_map : nullptr;
     if (!d_row_map_ptr) cudaMalloc(&d_row_map_ptr, parent.num_instances * sizeof(int));
 
-    // 2. Mark Split (Assignment Map)
+    // 2. Mark Split
     int offset = split_feat_idx * parent.num_instances;
     int blockSize = 256;
     int gridSize = (parent.num_instances + blockSize - 1) / blockSize;
@@ -174,8 +188,7 @@ void split_gpu_dataview(const GPUDataview& parent, GPUDataview& left, GPUDatavie
         parent.d_values + offset, parent.d_row_indices + offset, d_row_map_ptr, parent.num_instances, threshold
     );
 
-    // 3. Parallel Partition (One kernel call for ALL features)
-    // This replaces the loop + Thrust calls
+    // 3. Parallel Partition
     partition_all_features_kernel<<<parent.num_features, 256, 0, stream>>>(
         parent.d_values, parent.d_labels, parent.d_row_indices,
         d_row_map_ptr,
@@ -183,6 +196,9 @@ void split_gpu_dataview(const GPUDataview& parent, GPUDataview& left, GPUDatavie
         right.d_values, right.d_labels, right.d_row_indices,
         parent.num_instances, left.num_instances, right.num_instances
     );
+    
+    // Ensure we sync to get accurate CPU-side timing in dataview.cpp
+    cudaDeviceSynchronize(); 
 
     if (!use_pool) cudaFree(d_row_map_ptr);
 }

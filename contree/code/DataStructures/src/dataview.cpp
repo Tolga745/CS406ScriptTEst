@@ -162,6 +162,14 @@ const std::vector<int>& Dataview::get_possible_split_indices(int feature_index) 
 }
 
 void Dataview::split_data_points(const Dataview& current_dataview, int feature_index, int split_point, int split_unique_value_index, Dataview& left_dataview, Dataview& right_dataview, int current_max_depth) {
+    // STATICS FOR TIMING
+    static double total_cpu_time = 0;
+    static double total_gpu_time = 0;
+    static long long total_calls = 0;
+
+    auto start_cpu = std::chrono::high_resolution_clock::now();
+
+    // --- CPU SPLIT LOGIC START ---
     left_dataview.feature_data.resize(current_dataview.get_feature_number());
     right_dataview.feature_data.resize(current_dataview.get_feature_number());
 
@@ -306,12 +314,32 @@ void Dataview::split_data_points(const Dataview& current_dataview, int feature_i
             return a.first < b.first;
         });
     }
+    // --- CPU SPLIT LOGIC END ---
 
-    // If the parent has GPU data, split it for children
+    auto end_cpu = std::chrono::high_resolution_clock::now();
+
+
+    // --- GPU SPLIT LOGIC START ---
+    auto start_gpu = std::chrono::high_resolution_clock::now();
+
     if (current_dataview.gpu_view.d_values != nullptr) {
         float threshold = current_feature[split_point].value; 
         int buffer_idx = (current_max_depth > 0) ? (current_max_depth - 1) : 0;
         split_gpu_dataview(current_dataview.gpu_view, left_dataview.gpu_view, right_dataview.gpu_view, feature_index, threshold, buffer_idx);
+    }
+
+    auto end_gpu = std::chrono::high_resolution_clock::now();
+    // --- GPU SPLIT LOGIC END ---
+
+    // Stats Accumulation
+    total_cpu_time += std::chrono::duration<double>(end_cpu - start_cpu).count();
+    total_gpu_time += std::chrono::duration<double>(end_gpu - start_gpu).count();
+    total_calls++;
+
+    if (total_calls % 1000 == 0) {
+        std::cout << "[DEBUG] Calls: " << total_calls 
+                  << " | CPU Time: " << total_cpu_time << "s" 
+                  << " | GPU Time: " << total_gpu_time << "s" << std::endl;
     }
 }
 
