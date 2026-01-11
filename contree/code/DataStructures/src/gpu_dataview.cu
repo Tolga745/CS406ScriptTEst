@@ -47,6 +47,15 @@ void split_gpu_dataview(const GPUDataview& parent, GPUDataview& left, GPUDatavie
     // --- OPTIMIZATION START ---
     bool use_pool = (child_depth < recursion_buffers.size());
 
+    static int debug_counter = 0;
+    if (debug_counter++ % 1000 == 0) {
+        if (use_pool) {
+            std::cout << "[GPU] Using Pool for depth " << child_depth << std::endl;
+        } else {
+            std::cout << "[GPU] !!! FALLBACK TO MALLOC (Pool Miss) !!! Depth: " << child_depth << " PoolSize: " << recursion_buffers.size() << std::endl;
+        }
+    }
+
     if (use_pool) {
         auto& buffer = recursion_buffers[child_depth];
         
