@@ -26,7 +26,7 @@ struct RowSidePredicate {
 
 
 
-/__global__ void partition_features_kernel(
+__global__ void partition_features_kernel(
     const float* __restrict__ src_values,
     const int* __restrict__ src_labels,
     const int* __restrict__ src_indices,
