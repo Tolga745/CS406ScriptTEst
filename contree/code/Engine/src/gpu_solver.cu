@@ -11,6 +11,49 @@
 // --- GLOBAL DEFINITION ---
 GPUDataset global_gpu_dataset;
 
+std::vector<GPURecursionBuffer> recursion_buffers;
+int* d_global_row_map = nullptr;
+
+void GPURecursionBuffer::allocate(size_t total_elements) {
+    cudaMalloc(&d_values, total_elements * sizeof(float));
+    cudaMalloc(&d_labels, total_elements * sizeof(int));
+    cudaMalloc(&d_row_indices, total_elements * sizeof(int));
+}
+
+void GPURecursionBuffer::free() {
+    if (d_values) cudaFree(d_values);
+    if (d_labels) cudaFree(d_labels);
+    if (d_row_indices) cudaFree(d_row_indices);
+    d_values = nullptr;
+}
+
+void allocate_recursion_buffers(int max_depth, int num_instances, int num_features) {
+    // Free existing if any
+    free_recursion_buffers();
+
+    // Allocate global scratch map
+    cudaMalloc(&d_global_row_map, num_instances * sizeof(int));
+
+    // Allocate buffers for depths 0 to max_depth
+    size_t total_elements = (size_t)num_instances * num_features;
+    recursion_buffers.resize(max_depth + 1);
+
+    for(int i = 0; i <= max_depth; ++i) {
+        recursion_buffers[i].allocate(total_elements);
+    }
+}
+
+void free_recursion_buffers() {
+    for(auto& buf : recursion_buffers) {
+        buf.free();
+    }
+    recursion_buffers.clear();
+    if (d_global_row_map) {
+        cudaFree(d_global_row_map);
+        d_global_row_map = nullptr;
+    }
+}
+
 // --- GPUDataset IMPLEMENTATION ---
 
 void GPUDataset::initialize(const Dataset& cpu_dataset) {

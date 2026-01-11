@@ -5,6 +5,22 @@
 #include "dataset.h"
 #include "gpu_structs.h"
 
+
+struct GPURecursionBuffer {
+    float* d_values = nullptr;
+    int* d_labels = nullptr;
+    int* d_row_indices = nullptr;
+
+    void allocate(size_t total_elements);
+    void free();
+};
+
+extern std::vector<GPURecursionBuffer> recursion_buffers;
+extern int* d_global_row_map; // Shared scratch buffer
+
+void allocate_recursion_buffers(int max_depth, int num_instances, int num_features);
+void free_recursion_buffers();
+
 struct GPUDataset {
     // Permanent Data (Read Only)
     float* d_values;
@@ -14,7 +30,7 @@ struct GPUDataset {
     int num_features;
     int num_instances;
     int num_classes;
-
+    size_t total_elements;
     
     int* d_assignment_buffer;   // Size: num_instances
     

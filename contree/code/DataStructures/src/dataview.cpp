@@ -310,7 +310,9 @@ void Dataview::split_data_points(const Dataview& current_dataview, int feature_i
     // If the parent has GPU data, split it for children
     if (current_dataview.gpu_view.d_values != nullptr) {
         float threshold = current_feature[split_point].value; // Value at split boundary (Right starts here)
-        split_gpu_dataview(current_dataview.gpu_view, left_dataview.gpu_view, right_dataview.gpu_view, feature_index, threshold);
+
+        int buffer_idx = (current_max_depth > 0) ? (current_max_depth - 1) : 0;
+        split_gpu_dataview(current_dataview.gpu_view, left_dataview.gpu_view, right_dataview.gpu_view, feature_index, threshold, buffer_idx);
     }
 }
 

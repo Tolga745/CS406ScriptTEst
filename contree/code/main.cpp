@@ -35,6 +35,8 @@ void create_optimal_decision_tree(std::string file_name, int run_number, Configu
 
         global_gpu_dataset.initialize(sorted_dataset);
 
+        allocate_recursion_buffers(config.max_depth, sorted_dataset.get_instance_number(), sorted_dataset.get_features_size());
+
         Dataview dataview = Dataview(&sorted_dataset, &unsorted_dataset, class_number, config.sort_gini);
 
 
@@ -48,6 +50,8 @@ void create_optimal_decision_tree(std::string file_name, int run_number, Configu
             max_gap = int(max_gap * config.max_gap_decay);
         } while (max_gap > 0);
 
+
+        free_recursion_buffers();
 
         global_gpu_dataset.free();
         auto stop = std::chrono::high_resolution_clock::now();

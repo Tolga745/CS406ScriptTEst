@@ -1,4 +1,5 @@
 #include "gpu_dataview.h"
+#include "gpu_solver.cuh"
 #include <thrust/device_ptr.h>
 #include <thrust/partition.h>
 #include <thrust/execution_policy.h>
@@ -39,35 +40,47 @@ __global__ void mark_split_indices_kernel(
     }
 }
 
-void split_gpu_dataview(const GPUDataview& parent, GPUDataview& left, GPUDataview& right, int split_feat_idx, float threshold, cudaStream_t stream) {
-    // 1. Setup metadata
-
-    static int call_counter = 0;
-    call_counter++;
-    if(call_counter % 100 == 0) {
-        std::cout << "[DEBUG] split_gpu_dataview called " << call_counter << " times. (Heavy GPU Alloc)" << std::endl;
-    }
+void split_gpu_dataview(const GPUDataview& parent, GPUDataview& left, GPUDataview& right, int split_feat_idx, float threshold, int child_depth, cudaStream_t stream) {
     left.num_features = parent.num_features; left.num_classes = parent.num_classes;
-    left.owns_memory = true;
-
     right.num_features = parent.num_features; right.num_classes = parent.num_classes;
-    right.owns_memory = true;
-    
-    // 2. Allocate Temporary Map
-    // Map size must cover the maximum possible row index. 
-    // Since we use d_original_indices which are 0..TotalDatasetSize-1, we need TotalDatasetSize.
-    // However, we might not know TotalDatasetSize here easily without querying.
-    // Hack: Use a large enough buffer or pass global size. 
-    // For safety, let's assume we can get it from max element or passed in. 
-    // Optimization: Just use parent.num_instances if we re-indexed, but we didn't.
-    // Let's rely on the fact that row indices are < 10,000,000 usually. 
-    // A better way is to pass Global Dataset Size to this function.
-    // For this context, we'll allocate 10M integers (approx 40MB), which is safe for most datasets.
-    int max_rows = 10000000; 
-    int* d_row_map;
-    cudaMalloc(&d_row_map, max_rows * sizeof(int));
 
-    // 3. Mark the split
+    // --- OPTIMIZATION START ---
+    bool use_pool = (child_depth < recursion_buffers.size());
+
+    if (use_pool) {
+        auto& buffer = recursion_buffers[child_depth];
+        
+        // Point Left to the start of the pre-allocated buffer
+        left.d_values      = buffer.d_values;
+        left.d_labels      = buffer.d_labels;
+        left.d_row_indices = buffer.d_row_indices;
+        left.owns_memory   = false;
+
+        // Point Right to the memory immediately after Left's data
+        size_t left_total_size = (size_t)left.num_instances * left.num_features;
+        right.d_values      = buffer.d_values + left_total_size;
+        right.d_labels      = buffer.d_labels + left_total_size;
+        right.d_row_indices = buffer.d_row_indices + left_total_size;
+        right.owns_memory   = false;
+    } else {
+        // Fallback (Slow)
+        size_t left_elem = (size_t)left.num_instances * left.num_features;
+        size_t right_elem = (size_t)right.num_instances * right.num_features;
+        cudaMalloc(&left.d_values, left_elem * sizeof(float));
+        cudaMalloc(&left.d_labels, left_elem * sizeof(int));
+        cudaMalloc(&left.d_row_indices, left_elem * sizeof(int));
+        cudaMalloc(&right.d_values, right_elem * sizeof(float));
+        cudaMalloc(&right.d_labels, right_elem * sizeof(int));
+        cudaMalloc(&right.d_row_indices, right_elem * sizeof(int));
+        left.owns_memory = true;
+        right.owns_memory = true;
+    }
+    
+    int* d_row_map_ptr = use_pool ? d_global_row_map : nullptr;
+    if (!d_row_map_ptr) cudaMalloc(&d_row_map_ptr, parent.num_instances * sizeof(int));
+
+    // --- OPTIMIZATION END ---
+
     int offset = split_feat_idx * parent.num_instances;
     int blockSize = 256;
     int gridSize = (parent.num_instances + blockSize - 1) / blockSize;
@@ -75,29 +88,11 @@ void split_gpu_dataview(const GPUDataview& parent, GPUDataview& left, GPUDatavie
     mark_split_indices_kernel<<<gridSize, blockSize, 0, stream>>>(
         parent.d_values + offset,
         parent.d_row_indices + offset,
-        d_row_map,
+        d_row_map_ptr,
         parent.num_instances,
         threshold
     );
 
-    // 4. Allocate Memory for Children
-    // We already know left/right sizes from the Dataview object (populated by CPU logic before calling this)
-    // Wait, caller (dataview.cpp) must set num_instances before calling!
-    // Assuming left.num_instances and right.num_instances are set.
-    
-    size_t left_elem = (size_t)left.num_instances * left.num_features;
-    size_t right_elem = (size_t)right.num_instances * right.num_features;
-
-    cudaMalloc(&left.d_values, left_elem * sizeof(float));
-    cudaMalloc(&left.d_labels, left_elem * sizeof(int));
-    cudaMalloc(&left.d_row_indices, left_elem * sizeof(int));
-    // unique indices optional, skipping for now to save memory/time
-
-    cudaMalloc(&right.d_values, right_elem * sizeof(float));
-    cudaMalloc(&right.d_labels, right_elem * sizeof(int));
-    cudaMalloc(&right.d_row_indices, right_elem * sizeof(int));
-
-    // 5. Partition Data
     for (int f = 0; f < parent.num_features; f++) {
         size_t p_offset = (size_t)f * parent.num_instances;
         size_t l_offset = (size_t)f * left.num_instances;
@@ -126,9 +121,9 @@ void split_gpu_dataview(const GPUDataview& parent, GPUDataview& left, GPUDatavie
             zip_in, zip_in + parent.num_instances,
             zip_out_left,
             zip_out_right,
-            RowSidePredicate(d_row_map)
+            RowSidePredicate(d_row_map_ptr)
         );
     }
 
-    cudaFree(d_row_map);
+    if (!use_pool) cudaFree(d_row_map_ptr);
 }
