@@ -23,6 +23,11 @@ void GeneralSolver::create_optimal_decision_tree(const Dataview& dataview, const
 
     if (solution_configuration.max_depth == 2) {
         SpecializedSolver::create_optimal_decision_tree(dataview, solution_configuration, current_optimal_decision_tree, std::min(upper_bound, current_optimal_decision_tree->misclassification_score));
+        
+        if (current_optimal_decision_tree->misclassification_score <= upper_bound) {
+            Cache::global_cache.store(dataview, solution_configuration.max_depth, current_optimal_decision_tree);
+        }
+        
         return;
     }
 
