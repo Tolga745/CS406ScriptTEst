@@ -11,7 +11,7 @@ from datetime import datetime
 #   /code/build/ConTree
 #   /script/script.py  <-- You are here
 #   /datasets/
-DATASET_FOLDER = "../datasets"
+DATASET_FOLDER = "../../datasets"
 BINARY_PARALLEL = "../build/ConTree"
 
 BASELINE_TXT = "./baseline.txt"
