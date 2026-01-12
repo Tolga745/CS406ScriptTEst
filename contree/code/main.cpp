@@ -8,7 +8,7 @@
 #include "dataset.h"
 #include "dataview.h"
 #include "file_reader.h"
-#include "general_solver.h"
+#include "general_solver_version23.h"
 #include "parameter_handler.h"
 #include "statistics.h"
 #include "tree.h"

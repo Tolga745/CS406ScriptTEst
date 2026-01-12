@@ -5,7 +5,7 @@
 #include <variant>
 #include <algorithm>
 #include "parameter_handler.h"
-#include "general_solver.h"
+#include "general_solver_version23.h"
 #include "dataset.h"
 #include "configuration.h"
 #include "statistics.h"
