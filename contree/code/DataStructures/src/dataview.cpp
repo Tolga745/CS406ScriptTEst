@@ -307,8 +307,12 @@ void Dataview::split_data_points(const Dataview& current_dataview, int feature_i
 
     // --- GPU SPLIT LOGIC ---
     if (current_dataview.gpu_view.d_values != nullptr) {
-        float threshold = current_feature[split_point].value; 
-        int buffer_idx = (current_max_depth > 0) ? (current_max_depth - 1) : 0;
+        float threshold = current_feature[split_point].value;
+        // Map remaining max_depth to buffer index
+        // Buffer 0 is reserved for prepare_gpu_view, so we use 1-based indexing
+        // At max_depth=4: use buffers[1], then[2], then[3], then[4]
+        // At max_depth=5: use buffers[1], then[2], ..., then[5]
+        int buffer_idx = (7 - current_max_depth); // Maps: depth 4->3, 3->4, 2->5, 1->6, 0->7
         split_gpu_dataview(current_dataview.gpu_view, left_dataview.gpu_view, right_dataview.gpu_view, feature_index, threshold, buffer_idx);
     }
 }
