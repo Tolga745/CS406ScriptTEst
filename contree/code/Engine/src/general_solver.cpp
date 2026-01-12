@@ -1,233 +1,397 @@
-#include "general_solver.h"
-#include <algorithm>
-#include <mutex>
-#include <atomic>
-#include <queue>
-#include <omp.h> // Make sure to enable OpenMP in your compiler settings
+#include "general_solver_version23.h" // Ensure this matches your header name (general_solver.h or general_solver_version23.h)
 
-// Mutex to protect the update of 'current_optimal_decision_tree' when merging threads
+#include <algorithm>
+#include <atomic>
+#include <mutex>
+#include <omp.h>
+#include <queue>
+#include <vector>
+#include <iostream>
+#include <cmath>
+
+// GPU Integration
+#include "gpu_solver.cuh"
+#include "gpu_dataview.h"
+
 std::mutex GeneralSolver::tree_mutex;
 
-// top-level optimization
-void GeneralSolver::create_optimal_decision_tree(const Dataview& dataview, const Configuration& solution_configuration, std::shared_ptr<Tree>& current_optimal_decision_tree, int upper_bound) {
-    // early stopping
+// ───────────────────────────────────────────────────────────────
+// HYBRID SOLVER: OpenMP + CUDA Integration
+// ───────────────────────────────────────────────────────────────
+void GeneralSolver::create_optimal_decision_tree(
+    const Dataview& dataview,
+    const Configuration& solution_configuration,
+    std::shared_ptr<Tree>& current_optimal_decision_tree,
+    int upper_bound,
+    GPUDataview* gpu_view
+) {
+    // 1. Base Cases & Early Pruning (CPU)
     if (current_optimal_decision_tree->misclassification_score == 0 || dataview.get_dataset_size() == 0) {
         return;
     }
 
-    // Cache check (Thread-safe due to internal Cache mutex)
     if (Cache::global_cache.is_cached(dataview, solution_configuration.max_depth)) {
         current_optimal_decision_tree = Cache::global_cache.retrieve(dataview, solution_configuration.max_depth);
-        // Note: statistical updates might need to be atomic if precise tracking is required in parallel
-        // statistics::total_number_cache_hits += 1; 
         return;
     }
 
-    calculate_leaf_node(dataview.get_class_number(), dataview.get_dataset_size(), dataview.get_label_frequency(), current_optimal_decision_tree);
-    
-    // early stopping
-    if (solution_configuration.max_depth == 0) {
+    calculate_leaf_node(
+        dataview.get_class_number(),
+        dataview.get_dataset_size(),
+        dataview.get_label_frequency(),
+        current_optimal_decision_tree
+    );
+
+    if (solution_configuration.max_depth == 0) return;
+    if (current_optimal_decision_tree->misclassification_score <= solution_configuration.max_gap ||
+        dataview.get_dataset_size() == 1) {
         return;
     }
 
-    if (current_optimal_decision_tree->misclassification_score <= solution_configuration.max_gap || dataview.get_dataset_size() == 1) {
-        return;
-    }
+    // ───────────────────────────────────────────────────────────────
+    // GPU EXECUTION PATH
+    // ───────────────────────────────────────────────────────────────
+    bool gpu_path_taken = false;
+    bool is_gpu_root_alloc = false;
 
-    // depth-2 special solver
-    if (solution_configuration.max_depth == 2) {
-        SpecializedSolver::create_optimal_decision_tree(dataview, solution_configuration, current_optimal_decision_tree, std::min(upper_bound, current_optimal_decision_tree->misclassification_score));
-        return;
-    }
-
-    // --- PARALLELIZATION START ---
-    
-    // 1. Shared Atomic Upper Bound: Allows threads to read the "record to beat" without locking.
-    std::atomic<int> shared_ub(std::min(upper_bound, current_optimal_decision_tree->misclassification_score));
-
-    // 2. Parallel Loop over Features
-    // schedule(dynamic) is crucial because some features take much longer to solve than others.
-    #pragma omp parallel for schedule(dynamic)
-    for (int feature_nr = 0; feature_nr < dataview.get_feature_number(); feature_nr++) {
-        
-        // Check global time limit inside the parallel loop
-        if (!solution_configuration.stopwatch.IsWithinTimeLimit()) continue;
-
-        // Optimization: If another thread found a perfect solution (0 error), stop working.
-        int current_global_ub = shared_ub.load();
-        if (current_global_ub == 0) continue;
-
-        int feature_index = dataview.gini_values[feature_nr].second;
-
-        // 3. Thread-Local Tree Copy
-        // We cannot modify 'current_optimal_decision_tree' directly.
-        // Each thread works on its own copy initialized with the *current best known* score.
-        std::shared_ptr<Tree> thread_local_tree = std::make_shared<Tree>(*current_optimal_decision_tree);
-        
-        // Pass the ATOMIC upper bound value to the solver
-        create_optimal_decision_tree(dataview, solution_configuration, feature_index, thread_local_tree, current_global_ub);
-
-        // 4. Critical Section: Merge Results
-        // Only lock if we actually found something better than the *snapshot* we took earlier.
-        if (thread_local_tree->misclassification_score < current_global_ub) {
-            std::lock_guard<std::mutex> lock(tree_mutex);
+    // A. GPU Initialization (At Root)
+    if (solution_configuration.is_root && gpu_view == nullptr) {
+        // Heuristic: Use GPU only for reasonably sized datasets to justify transfer overhead
+        if (dataview.get_dataset_size() > 50000) { 
+            allocate_recursion_buffers(solution_configuration.max_depth, dataview.get_dataset_size(), dataview.get_feature_number());
             
-            // Double-check: Has the global state improved while we were waiting for the lock?
-            if (thread_local_tree->misclassification_score < current_optimal_decision_tree->misclassification_score) {
-                
-                // Update the master tree pointer
-                current_optimal_decision_tree = thread_local_tree;
-                
-                // Update the atomic bound so other threads see it immediately
-                shared_ub.store(current_optimal_decision_tree->misclassification_score);
-            }
+            // CORRECTED: Call initialize() instead of manual cudaMalloc
+            // This allocates all necessary GPU buffers (d_values, d_score_L, etc.)
+            global_gpu_dataset.initialize(dataview);
+            
+            // Prepare the root view wrapper
+            static GPUDataview root_view_storage;
+            prepare_gpu_view(dataview, root_view_storage);
+            
+            gpu_view = &root_view_storage;
+            is_gpu_root_alloc = true;
         }
     }
-    // --- PARALLELIZATION END ---
+
+    // B. GPU Execution
+    if (gpu_view != nullptr && gpu_view->num_instances > 0) {
+        int num_features = dataview.get_feature_number();
+
+        // Host containers for results
+        std::vector<int> h_scores_L(num_features), h_leaf_scores_L(num_features);
+        std::vector<int> h_scores_R(num_features), h_leaf_scores_R(num_features);
+        
+        std::vector<float> h_thresh_L(num_features), h_thresh_R(num_features);
+        std::vector<int> h_lbl_L_L(num_features), h_lbl_L_R(num_features), h_lbl_R_L(num_features), h_lbl_R_R(num_features);
+        std::vector<int> h_cs_L_L(num_features), h_cs_L_R(num_features), h_cs_R_L(num_features), h_cs_R_R(num_features);
+        std::vector<int> h_leaf_lbl_L(num_features), h_leaf_lbl_R(num_features);
+
+        // Run GPU Solver
+        run_specialized_solver_gpu(
+            *gpu_view, -1, 0.0f, upper_bound,
+            h_scores_L.data(), h_thresh_L.data(), h_lbl_L_L.data(), h_lbl_L_R.data(), h_cs_L_L.data(), h_cs_L_R.data(), h_leaf_scores_L.data(), h_leaf_lbl_L.data(),
+            h_scores_R.data(), h_thresh_R.data(), h_lbl_R_L.data(), h_lbl_R_R.data(), h_cs_R_L.data(), h_cs_R_R.data(), h_leaf_scores_R.data(), h_leaf_lbl_R.data()
+        );
+
+        // Find Best Split
+        int best_feature_idx = -1;
+        float best_threshold = 0.0f;
+        int global_best_score = std::min(upper_bound, current_optimal_decision_tree->misclassification_score);
+        
+        // Check Left outputs (default for root of view)
+        for (int f = 0; f < num_features; ++f) {
+            int score = h_scores_L[f];
+            if (score < global_best_score) {
+                global_best_score = score;
+                best_feature_idx = f;
+                best_threshold = h_thresh_L[f];
+            }
+        }
+
+        if (best_feature_idx != -1) {
+            // Found a valid split on GPU
+            
+            // 1. Physically Split on GPU
+            GPUDataview left_gpu, right_gpu;
+            split_gpu_dataview(*gpu_view, left_gpu, right_gpu, best_feature_idx, best_threshold, solution_configuration.max_depth, 0);
+            
+            // 2. Prepare CPU Dataviews for recursion
+            Dataview left_dataview(dataview.get_class_number(), dataview.should_sort_by_gini_index());
+            Dataview right_dataview(dataview.get_class_number(), dataview.should_sort_by_gini_index());
+            
+            const auto& feature_vec = dataview.get_sorted_dataset_feature(best_feature_idx);
+            
+            // Binary search split point
+            auto it = std::lower_bound(feature_vec.begin(), feature_vec.end(), best_threshold, 
+                [](const Dataset::FeatureElement& a, float val){ return a.value < val; });
+            int split_point = std::distance(feature_vec.begin(), it);
+            int split_val_idx = (it != feature_vec.end()) ? it->unique_value_index : -1;
+            
+            Dataview::split_data_points(dataview, best_feature_idx, split_point, split_val_idx, left_dataview, right_dataview, solution_configuration.max_depth);
+
+            // 3. Construct Tree Nodes
+            std::shared_ptr<Tree> left_dt = std::make_shared<Tree>(-1, global_best_score);
+            std::shared_ptr<Tree> right_dt = std::make_shared<Tree>(-1, global_best_score);
+
+            // 4. Recurse
+            auto& larger_data = (left_dataview.get_dataset_size() < right_dataview.get_dataset_size()) ? right_dataview : left_dataview;
+            auto& smaller_data = (left_dataview.get_dataset_size() < right_dataview.get_dataset_size()) ? left_dataview : right_dataview;
+            
+            auto& larger_gpu = (left_dataview.get_dataset_size() < right_dataview.get_dataset_size()) ? right_gpu : left_gpu;
+            auto& smaller_gpu = (left_dataview.get_dataset_size() < right_dataview.get_dataset_size()) ? left_gpu : right_gpu;
+            
+            auto& larger_dt = (left_dataview.get_dataset_size() < right_dataview.get_dataset_size()) ? right_dt : left_dt;
+            auto& smaller_dt = (left_dataview.get_dataset_size() < right_dataview.get_dataset_size()) ? left_dt : right_dt;
+
+            Configuration left_conf = solution_configuration.GetLeftSubtreeConfig();
+            GeneralSolver::create_optimal_decision_tree(larger_data, left_conf, larger_dt, global_best_score, &larger_gpu);
+
+            Configuration right_conf = solution_configuration.GetRightSubtreeConfig(left_conf.max_gap);
+            GeneralSolver::create_optimal_decision_tree(smaller_data, right_conf, smaller_dt, global_best_score - larger_dt->misclassification_score, &smaller_gpu);
+
+            // 5. Update Root
+            current_optimal_decision_tree->update_split(best_feature_idx, best_threshold, left_dt, right_dt);
+            current_optimal_decision_tree->misclassification_score = left_dt->misclassification_score + right_dt->misclassification_score;
+        }
+
+        gpu_path_taken = true;
+    }
+
+    // Cleanup GPU Memory if Root
+    if (is_gpu_root_alloc) {
+        global_gpu_dataset.free(); 
+        free_recursion_buffers();
+    }
+
+    if (gpu_path_taken) {
+        if (current_optimal_decision_tree->misclassification_score <= upper_bound) {
+            Cache::global_cache.store(dataview, solution_configuration.max_depth, current_optimal_decision_tree);
+        }
+        return;
+    }
+
+    // ───────────────────────────────────────────────────────────────
+    // CPU FALLBACK (Original OpenMP Implementation)
+    // ───────────────────────────────────────────────────────────────
+
+    // Depth-2 special solver
+    if (solution_configuration.max_depth == 2) {
+        SpecializedSolver::create_optimal_decision_tree(
+            dataview,
+            solution_configuration,
+            current_optimal_decision_tree,
+            std::min(upper_bound, current_optimal_decision_tree->misclassification_score)
+        );
+        return;
+    }
+
+    const bool allow_parallel = !omp_in_parallel();
+    const int max_threads = omp_get_max_threads();
+    std::atomic<int> shared_best(std::min(upper_bound, current_optimal_decision_tree->misclassification_score));
+
+    // Heuristic for CPU parallel strategy
+    const bool use_feature_parallel = allow_parallel && (dataview.get_feature_number() > max_threads);
+
+    if (use_feature_parallel) {
+        #pragma omp parallel for schedule(dynamic)
+        for (int feature_nr = 0; feature_nr < dataview.get_feature_number(); feature_nr++) {
+            if (!solution_configuration.stopwatch.IsWithinTimeLimit()) continue;
+
+            const int ub_snapshot = shared_best.load(std::memory_order_relaxed);
+            if (ub_snapshot == 0) continue;
+
+            const int feature_index = dataview.gini_values[feature_nr].second;
+            std::shared_ptr<Tree> thread_local_tree = std::make_shared<Tree>(-1, ub_snapshot);
+
+            calculate_leaf_node(
+                dataview.get_class_number(),
+                dataview.get_dataset_size(),
+                dataview.get_label_frequency(),
+                thread_local_tree
+            );
+
+            create_optimal_decision_tree_internal(
+                dataview,
+                solution_configuration,
+                feature_index,
+                thread_local_tree,
+                ub_snapshot,
+                false // Disable nested parallel
+            );
+
+            const int local_score = thread_local_tree->misclassification_score;
+            if (local_score < ub_snapshot) {
+                std::lock_guard<std::mutex> lock(GeneralSolver::tree_mutex);
+                if (local_score < current_optimal_decision_tree->misclassification_score) {
+                    current_optimal_decision_tree = thread_local_tree;
+                    shared_best.store(local_score, std::memory_order_relaxed);
+                }
+            }
+        }
+    } else {
+        // Block-based / Serial features
+        for (int feature_nr = 0; feature_nr < dataview.get_feature_number(); feature_nr++) {
+            if (!solution_configuration.stopwatch.IsWithinTimeLimit()) break;
+            const int ub_snapshot = shared_best.load(std::memory_order_relaxed);
+            if (ub_snapshot == 0) break;
+
+            const int feature_index = dataview.gini_values[feature_nr].second;
+            create_optimal_decision_tree_internal(
+                dataview,
+                solution_configuration,
+                feature_index,
+                current_optimal_decision_tree,
+                ub_snapshot,
+                allow_parallel
+            );
+            shared_best.store(current_optimal_decision_tree->misclassification_score, std::memory_order_relaxed);
+            if (current_optimal_decision_tree->misclassification_score == 0) break;
+        }
+    }
 
     if (current_optimal_decision_tree->misclassification_score <= upper_bound) {
         Cache::global_cache.store(dataview, solution_configuration.max_depth, current_optimal_decision_tree);
     }
 }
 
-// per feature optimization
-// branch step
-void GeneralSolver::create_optimal_decision_tree(const Dataview& dataview, const Configuration& solution_configuration, int feature_index, std::shared_ptr<Tree> &current_optimal_decision_tree, int upper_bound) {    
+// ───────────────────────────────────────────────────────────────
+// Internal Worker (CPU)
+// ───────────────────────────────────────────────────────────────
+void GeneralSolver::create_optimal_decision_tree_internal(
+    const Dataview& dataview,
+    const Configuration& solution_configuration,
+    int feature_index,
+    std::shared_ptr<Tree>& current_optimal_decision_tree,
+    int upper_bound,
+    bool run_in_parallel
+) {
     const std::vector<Dataset::FeatureElement>& current_feature = dataview.get_sorted_dataset_feature(feature_index);
-    
     const auto& possible_split_indices = dataview.get_possible_split_indices(feature_index);
+
+    const int num_splits = (int)possible_split_indices.size();
+    if (num_splits <= 0) return;
+
     IntervalsPruner interval_pruner(possible_split_indices, (solution_configuration.max_gap + 1) / 2);
-    // interval 
-    std::queue<IntervalsPruner::Bound> unsearched_intervals;
-    unsearched_intervals.push({0, (int)possible_split_indices.size() - 1, -1, -1});
+    const bool allow_parallel = run_in_parallel && !omp_in_parallel();
+    std::atomic<int> best_score_atomic(current_optimal_decision_tree->misclassification_score);
 
-    while(!unsearched_intervals.empty()) {
-        if (!solution_configuration.stopwatch.IsWithinTimeLimit()) return;
-        
-        // Check if our current best score is already beaten by the global upper bound 
-        // (This happens if `upper_bound` passed in was an atomic load from the parent loop)
-        if (current_optimal_decision_tree->misclassification_score == 0) return;
+    #pragma omp parallel if(allow_parallel)
+    {
+        const int num_threads = omp_get_num_threads();
+        const int thread_id = omp_get_thread_num();
+        const int chunk_size = (num_splits + num_threads - 1) / num_threads;
+        const int start_idx = thread_id * chunk_size;
+        const int end_idx = std::min(start_idx + chunk_size - 1, num_splits - 1);
 
-        auto current_interval = unsearched_intervals.front(); unsearched_intervals.pop();
-
-        if (interval_pruner.subinterval_pruning(current_interval, current_optimal_decision_tree->misclassification_score)) {
-            continue;
+        std::queue<IntervalsPruner::Bound> local_queue;
+        if (start_idx <= end_idx) {
+            local_queue.push({start_idx, end_idx, -1, -1});
         }
 
-        interval_pruner.interval_shrinking(current_interval, current_optimal_decision_tree->misclassification_score);
-        const auto& [left, right, current_left_bound, current_right_bound] = current_interval;
-        if (left > right) {
-            continue;
-        }
+        while (!local_queue.empty()) {
+            if (!solution_configuration.stopwatch.IsWithinTimeLimit()) break;
+            const int global_best = best_score_atomic.load(std::memory_order_relaxed);
+            if (global_best == 0) break;
 
-        const int mid = (left + right) / 2;
-        const int split_point = possible_split_indices[mid];
+            auto current_interval = local_queue.front();
+            local_queue.pop();
 
-        const int interval_half_distance = std::max(split_point - possible_split_indices[left], possible_split_indices[right] - split_point);
+            if (interval_pruner.subinterval_pruning(current_interval, global_best)) continue;
 
-        const float threshold = mid > 0 ? (current_feature[possible_split_indices[mid - 1]].value + current_feature[split_point].value) / 2.0f 
-                                  : (current_feature[split_point].value + current_feature[0].value) / 2.0f;  
-        const int split_unique_value_index = current_feature[split_point].unique_value_index;
-        
-        Dataview left_dataview = Dataview(dataview.get_class_number(), dataview.should_sort_by_gini_index());
-        Dataview right_dataview = Dataview(dataview.get_class_number(), dataview.should_sort_by_gini_index());
-        
-        // This is computationally expensive and memory intensive. 
-        // We keep it serial here to avoid over-subscribing threads (since we are already parallelizing features).
-        Dataview::split_data_points(dataview, feature_index, split_point, split_unique_value_index, left_dataview, right_dataview, solution_configuration.max_depth);
+            interval_pruner.interval_shrinking(current_interval, global_best);
+            const auto& [left, right, current_left_bound, current_right_bound] = current_interval;
+            if (left > right) continue;
 
-        std::shared_ptr<Tree> left_optimal_dt  = std::make_shared<Tree>(-1, current_optimal_decision_tree->misclassification_score);
-        std::shared_ptr<Tree> right_optimal_dt = std::make_shared<Tree>(-1, current_optimal_decision_tree->misclassification_score);
+            const int mid = (left + right) / 2;
+            const int split_point = possible_split_indices[mid];
+            const int split_unique_value_index = current_feature[split_point].unique_value_index;
 
-        // Here firstly compute the bigger dataset since it might make computing the smaller dataset obsolete
-        auto& smaller_data = (left_dataview.get_dataset_size() < right_dataview.get_dataset_size() ) ? left_dataview : right_dataview;
-        auto& larger_data  = (left_dataview.get_dataset_size()  < right_dataview.get_dataset_size() ) ? right_dataview : left_dataview;
+            // Threshold calculation
+            const float threshold = (mid > 0)
+                ? (current_feature[possible_split_indices[mid - 1]].value + current_feature[split_point].value) / 2.0f
+                : (current_feature[split_point].value + current_feature[0].value) / 2.0f;
 
-        auto& smaller_optimal_dt = (left_dataview.get_dataset_size()  < right_dataview.get_dataset_size() ) ? left_optimal_dt : right_optimal_dt;
-        auto& larger_optimal_dt  = (left_dataview.get_dataset_size()  < right_dataview.get_dataset_size() ) ? right_optimal_dt : left_optimal_dt;
+            // Construct Children Views (CPU)
+            Dataview left_dataview(dataview.get_class_number(), dataview.should_sort_by_gini_index());
+            Dataview right_dataview(dataview.get_class_number(), dataview.should_sort_by_gini_index());
 
-        int larger_ub = solution_configuration.use_upper_bound ? std::min(upper_bound, current_optimal_decision_tree->misclassification_score)
-                                       : current_optimal_decision_tree->misclassification_score;
+            Dataview::split_data_points(
+                dataview,
+                feature_index,
+                split_point,
+                split_unique_value_index,
+                left_dataview,
+                right_dataview,
+                solution_configuration.max_depth
+            );
+
+            std::shared_ptr<Tree> left_optimal_dt = std::make_shared<Tree>(-1, global_best);
+            std::shared_ptr<Tree> right_optimal_dt = std::make_shared<Tree>(-1, global_best);
+
+            // Recursive Calls
+            auto& smaller_data = (left_dataview.get_dataset_size() < right_dataview.get_dataset_size()) ? left_dataview : right_dataview;
+            auto& larger_data  = (left_dataview.get_dataset_size() < right_dataview.get_dataset_size()) ? right_dataview : left_dataview;
+            auto& smaller_dt = (left_dataview.get_dataset_size() < right_dataview.get_dataset_size()) ? left_optimal_dt : right_optimal_dt;
+            auto& larger_dt  = (left_dataview.get_dataset_size() < right_dataview.get_dataset_size()) ? right_optimal_dt : left_optimal_dt;
+
+            const int ub_for_larger = solution_configuration.use_upper_bound ? std::min(upper_bound, global_best) : global_best;
+            const Configuration left_conf = solution_configuration.GetLeftSubtreeConfig();
+            
+            GeneralSolver::create_optimal_decision_tree(larger_data, left_conf, larger_dt, ub_for_larger, nullptr);
+
+            const int best_after_larger = best_score_atomic.load(std::memory_order_relaxed);
+            // Dynamic bound calculation...
+            const int interval_half_distance = std::max(split_point - possible_split_indices[left], possible_split_indices[right] - split_point);
+            const int ub_for_smaller = solution_configuration.use_upper_bound 
+                ? std::max(std::min(best_after_larger, upper_bound) - larger_dt->misclassification_score, interval_half_distance)
+                : best_after_larger;
+
+            if (ub_for_smaller > 0 || (ub_for_smaller == 0 && best_after_larger == larger_dt->misclassification_score)) {
+                const Configuration right_conf = solution_configuration.GetRightSubtreeConfig(left_conf.max_gap);
+                GeneralSolver::create_optimal_decision_tree(smaller_data, right_conf, smaller_dt, ub_for_smaller, nullptr);
+
+                const int candidate_score = left_optimal_dt->misclassification_score + right_optimal_dt->misclassification_score;
                 
-        // statistics::total_number_of_general_solver_calls += 1; // Careful with stats in parallel environments
-        
-        // Recursive Call 1
-        const Configuration left_solution_configuration = solution_configuration.GetLeftSubtreeConfig();
-        GeneralSolver::create_optimal_decision_tree(larger_data, left_solution_configuration, larger_optimal_dt, larger_ub);
-
-        int smaller_ub = solution_configuration.use_upper_bound ? std::max(std::min(current_optimal_decision_tree->misclassification_score, upper_bound) - larger_optimal_dt->misclassification_score, interval_half_distance) 
-                                        : current_optimal_decision_tree->misclassification_score;
-
-        if (smaller_ub > 0 || (smaller_ub == 0 && current_optimal_decision_tree->misclassification_score == larger_optimal_dt->misclassification_score)) {
-            // statistics::total_number_of_general_solver_calls += 1;
-            
-            // Recursive Call 2
-            const Configuration right_solution_configuration = solution_configuration.GetRightSubtreeConfig(left_solution_configuration.max_gap);
-            GeneralSolver::create_optimal_decision_tree(smaller_data, right_solution_configuration, smaller_optimal_dt, smaller_ub);
-            
-            RUNTIME_ASSERT(left_optimal_dt->misclassification_score >= 0, "Left tree should have non-negative misclassification score.");
-            RUNTIME_ASSERT(right_optimal_dt->misclassification_score >= 0, "Right tree should have non-negative misclassification score.");
-
-            const int current_best_score = left_optimal_dt->misclassification_score + right_optimal_dt->misclassification_score;
-
-            if (current_best_score < current_optimal_decision_tree->misclassification_score) {
-                RUNTIME_ASSERT(left_optimal_dt->is_initialized(), "Left tree should be initialized.");
-                RUNTIME_ASSERT(right_optimal_dt->is_initialized(), "Right tree should be initialized.");
-
-                current_optimal_decision_tree->misclassification_score = current_best_score;
-                current_optimal_decision_tree->update_split(feature_index, threshold, left_optimal_dt, right_optimal_dt);
-
-                if (current_best_score == 0) {
-                    return;
+                if (candidate_score < best_score_atomic.load(std::memory_order_relaxed)) {
+                    std::lock_guard<std::mutex> lock(GeneralSolver::tree_mutex);
+                    if (candidate_score < current_optimal_decision_tree->misclassification_score) {
+                        current_optimal_decision_tree->update_split(feature_index, threshold, left_optimal_dt, right_optimal_dt);
+                        current_optimal_decision_tree->misclassification_score = candidate_score;
+                        best_score_atomic.store(candidate_score, std::memory_order_relaxed);
+                    }
                 }
-
-                if (PRINT_INTERMEDIARY_TIME_SOLUTIONS && solution_configuration.is_root)  {
-                    const auto stop = std::chrono::high_resolution_clock::now();
-                    const auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(stop - starting_time);
-                    // Use a lock for I/O if multiple roots are processed (unlikely here but good practice)
-                    // static std::mutex io_mutex;
-                    // std::lock_guard<std::mutex> io_lock(io_mutex);
-                    std::cout << "Time taken to get the misclassification score " << current_best_score << ": " << duration.count() / 1000.0 << " seconds" << std::endl;
-                }
+            } else {
+                smaller_dt->misclassification_score = -1;
             }
-        } else {
-            smaller_optimal_dt->misclassification_score = -1;
-        }
-        
-        interval_pruner.add_result(mid, left_optimal_dt->misclassification_score, right_optimal_dt->misclassification_score);
 
-        if (left == right) {
-            continue;
-        }
+            interval_pruner.add_result(mid, left_optimal_dt->misclassification_score, right_optimal_dt->misclassification_score);
 
-        const int score_difference = left_optimal_dt->misclassification_score + right_optimal_dt->misclassification_score - current_optimal_decision_tree->misclassification_score;
-        const auto [new_bound_left, new_bound_right] = interval_pruner.neighbourhood_pruning(score_difference, left, right, mid);
-
-        if (new_bound_left <= right) {
-            unsearched_intervals.push({new_bound_left, right, mid, current_right_bound});
-        }
-
-        if (left <= new_bound_right) {
-            unsearched_intervals.push({left, new_bound_right, current_left_bound, mid});
+            if (left == right) continue;
+            const int best_now = best_score_atomic.load(std::memory_order_relaxed);
+            const int score_diff = left_optimal_dt->misclassification_score + right_optimal_dt->misclassification_score - best_now;
+            const auto [new_l, new_r] = interval_pruner.neighbourhood_pruning(score_diff, left, right, mid);
+            if (new_l <= right) local_queue.push({new_l, right, mid, current_right_bound});
+            if (left <= new_r) local_queue.push({left, new_r, current_left_bound, mid});
         }
     }
 }
 
-void GeneralSolver::calculate_leaf_node(int class_number, int instance_number, const std::vector<int>& label_frequency, std::shared_ptr<Tree>& current_optimal_decision_tree) {
+void GeneralSolver::calculate_leaf_node(
+    int class_number,
+    int instance_number,
+    const std::vector<int>& label_frequency,
+    std::shared_ptr<Tree>& current_optimal_decision_tree
+) {
     int best_classification_score = -1;
     int best_classification_label = -1;
-
     for (int label = 0; label < class_number; label++) {
         if (label_frequency[label] > best_classification_score) {
             best_classification_score = label_frequency[label];
             best_classification_label = label;
         }
     }
-
     const int best_misclassification_score = instance_number - best_classification_score;
-
     if (best_misclassification_score < current_optimal_decision_tree->misclassification_score) {
-        RUNTIME_ASSERT(best_classification_label != -1, "Cannot assign negative leaf label.");
         current_optimal_decision_tree->make_leaf(best_classification_label, best_misclassification_score);
     }
 }
