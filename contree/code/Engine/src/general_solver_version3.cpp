@@ -1,4 +1,4 @@
-#include "general_solver_version23.h" // Assuming this is the header for version 3
+#include "general_solver_version23.h" // Ensure this matches your header name (general_solver.h or general_solver_version23.h)
 
 #include <algorithm>
 #include <atomic>
@@ -52,39 +52,24 @@ void GeneralSolver::create_optimal_decision_tree(
     // GPU EXECUTION PATH
     // ───────────────────────────────────────────────────────────────
     bool gpu_path_taken = false;
-    bool is_gpu_root = false;
+    bool is_gpu_root_alloc = false;
 
     // A. GPU Initialization (At Root)
     if (solution_configuration.is_root && gpu_view == nullptr) {
         // Heuristic: Use GPU only for reasonably sized datasets to justify transfer overhead
-        if (dataview.get_dataset_size() > 10000) { 
+        if (dataview.get_dataset_size() > 50000) { 
             allocate_recursion_buffers(solution_configuration.max_depth, dataview.get_dataset_size(), dataview.get_feature_number());
             
+            // CORRECTED: Call initialize() instead of manual cudaMalloc
+            // This allocates all necessary GPU buffers (d_values, d_score_L, etc.)
+            global_gpu_dataset.initialize(dataview);
             
+            // Prepare the root view wrapper
             static GPUDataview root_view_storage;
-            prepare_gpu_view(dataview, root_view_storage); // This uploads data to recursion_buffers[0]
+            prepare_gpu_view(dataview, root_view_storage);
             
-            
-            global_gpu_dataset.num_features = dataview.get_feature_number();
-            global_gpu_dataset.num_instances = dataview.get_dataset_size();
-            global_gpu_dataset.num_classes = dataview.get_class_number();
-            
-            size_t int_bytes = global_gpu_dataset.num_features * sizeof(int);
-            size_t float_bytes = global_gpu_dataset.num_features * sizeof(float);
-            cudaMalloc(&global_gpu_dataset.d_score_L, int_bytes);
-            cudaMalloc(&global_gpu_dataset.d_score_R, int_bytes);
-            cudaMalloc(&global_gpu_dataset.d_thresh_L, float_bytes);
-            cudaMalloc(&global_gpu_dataset.d_thresh_R, float_bytes);
-            cudaMalloc(&global_gpu_dataset.d_lbl_L_L, int_bytes); cudaMalloc(&global_gpu_dataset.d_lbl_L_R, int_bytes);
-            cudaMalloc(&global_gpu_dataset.d_lbl_R_L, int_bytes); cudaMalloc(&global_gpu_dataset.d_lbl_R_R, int_bytes);
-            cudaMalloc(&global_gpu_dataset.d_cscore_L_L, int_bytes); cudaMalloc(&global_gpu_dataset.d_cscore_L_R, int_bytes);
-            cudaMalloc(&global_gpu_dataset.d_cscore_R_L, int_bytes); cudaMalloc(&global_gpu_dataset.d_cscore_R_R, int_bytes);
-            cudaMalloc(&global_gpu_dataset.d_leaf_L, int_bytes); cudaMalloc(&global_gpu_dataset.d_leaf_R, int_bytes);
-            cudaMalloc(&global_gpu_dataset.d_leaflbl_L, int_bytes); cudaMalloc(&global_gpu_dataset.d_leaflbl_R, int_bytes);
-            cudaMalloc(&global_gpu_dataset.d_assignment_buffer, global_gpu_dataset.num_instances * sizeof(int));
-
             gpu_view = &root_view_storage;
-            is_gpu_root = true;
+            is_gpu_root_alloc = true;
         }
     }
 
@@ -96,7 +81,6 @@ void GeneralSolver::create_optimal_decision_tree(
         std::vector<int> h_scores_L(num_features), h_leaf_scores_L(num_features);
         std::vector<int> h_scores_R(num_features), h_leaf_scores_R(num_features);
         
-        // Detailed results (fetched only if needed, but we fetch all for now to simplify)
         std::vector<float> h_thresh_L(num_features), h_thresh_R(num_features);
         std::vector<int> h_lbl_L_L(num_features), h_lbl_L_R(num_features), h_lbl_R_L(num_features), h_lbl_R_R(num_features);
         std::vector<int> h_cs_L_L(num_features), h_cs_L_R(num_features), h_cs_R_L(num_features), h_cs_R_R(num_features);
@@ -114,7 +98,7 @@ void GeneralSolver::create_optimal_decision_tree(
         float best_threshold = 0.0f;
         int global_best_score = std::min(upper_bound, current_optimal_decision_tree->misclassification_score);
         
-        // Since we passed -1 (root mode), we look at 'Left' outputs which represent the current view split
+        // Check Left outputs (default for root of view)
         for (int f = 0; f < num_features; ++f) {
             int score = h_scores_L[f];
             if (score < global_best_score) {
@@ -131,14 +115,13 @@ void GeneralSolver::create_optimal_decision_tree(
             GPUDataview left_gpu, right_gpu;
             split_gpu_dataview(*gpu_view, left_gpu, right_gpu, best_feature_idx, best_threshold, solution_configuration.max_depth, 0);
             
-            // 2. Prepare CPU Dataviews for recursion (Necessary for legacy signature)
-            // We replicate the split on CPU. This is the "Hybrid" cost.
+            // 2. Prepare CPU Dataviews for recursion
             Dataview left_dataview(dataview.get_class_number(), dataview.should_sort_by_gini_index());
             Dataview right_dataview(dataview.get_class_number(), dataview.should_sort_by_gini_index());
             
             const auto& feature_vec = dataview.get_sorted_dataset_feature(best_feature_idx);
             
-            // Find split point using binary search
+            // Binary search split point
             auto it = std::lower_bound(feature_vec.begin(), feature_vec.end(), best_threshold, 
                 [](const Dataset::FeatureElement& a, float val){ return a.value < val; });
             int split_point = std::distance(feature_vec.begin(), it);
@@ -150,7 +133,7 @@ void GeneralSolver::create_optimal_decision_tree(
             std::shared_ptr<Tree> left_dt = std::make_shared<Tree>(-1, global_best_score);
             std::shared_ptr<Tree> right_dt = std::make_shared<Tree>(-1, global_best_score);
 
-            // 4. Recurse (Pass GPU pointers)
+            // 4. Recurse
             auto& larger_data = (left_dataview.get_dataset_size() < right_dataview.get_dataset_size()) ? right_dataview : left_dataview;
             auto& smaller_data = (left_dataview.get_dataset_size() < right_dataview.get_dataset_size()) ? left_dataview : right_dataview;
             
@@ -174,8 +157,8 @@ void GeneralSolver::create_optimal_decision_tree(
         gpu_path_taken = true;
     }
 
-    // Cleanup if we are at the root of a GPU dispatch
-    if (is_gpu_root) {
+    // Cleanup GPU Memory if Root
+    if (is_gpu_root_alloc) {
         global_gpu_dataset.free(); 
         free_recursion_buffers();
     }
@@ -354,7 +337,7 @@ void GeneralSolver::create_optimal_decision_tree_internal(
             const int ub_for_larger = solution_configuration.use_upper_bound ? std::min(upper_bound, global_best) : global_best;
             const Configuration left_conf = solution_configuration.GetLeftSubtreeConfig();
             
-            GeneralSolver::create_optimal_decision_tree(larger_data, left_conf, larger_dt, ub_for_larger, nullptr); // Pass nullptr for GPU view (standard recursion)
+            GeneralSolver::create_optimal_decision_tree(larger_data, left_conf, larger_dt, ub_for_larger, nullptr);
 
             const int best_after_larger = best_score_atomic.load(std::memory_order_relaxed);
             // Dynamic bound calculation...

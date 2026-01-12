@@ -1,13 +1,11 @@
 #include "gpu_solver.cuh"
-#include "dataview.h" // code2's dataview header
+#include "dataview.h"
 #include <cuda_runtime.h>
 #include <iostream>
 #include <vector>
 #include <algorithm>
 
 // --- CONSTANTS ---
-// Limit on number of classes for shared memory usage. 
-// 32 classes * 2 counters * 256 threads * 4 bytes = ~64KB shared mem.
 #define MAX_CLASSES 32 
 #define MAX_COUNTERS (MAX_CLASSES * 2)
 
@@ -32,11 +30,8 @@ void GPURecursionBuffer::free() {
 
 void allocate_recursion_buffers(int max_depth, int num_instances, int num_features) {
     free_recursion_buffers();
-
-    // Allocate global scratch map
     cudaMalloc(&d_global_row_map, num_instances * sizeof(int));
 
-    // Allocate buffers for depths 0 to max_depth
     size_t total_elements = (size_t)num_instances * num_features;
     recursion_buffers.resize(max_depth + 1);
 
@@ -58,9 +53,9 @@ void free_recursion_buffers() {
 
 // --- GPUDataset IMPLEMENTATION ---
 
-void GPUDataset::initialize(const Dataset& cpu_dataset) {
-    this->num_features = cpu_dataset.get_features_size();
-    this->num_instances = cpu_dataset.get_instance_number();
+void GPUDataset::initialize(const Dataview& dataview) {
+    this->num_features = dataview.get_feature_number();
+    this->num_instances = dataview.get_dataset_size();
     
     size_t total_elements = (size_t)this->num_features * this->num_instances;
     
@@ -74,15 +69,12 @@ void GPUDataset::initialize(const Dataset& cpu_dataset) {
     cudaMallocHost(&h_labels, total_elements * sizeof(int));
     cudaMallocHost(&h_indices, total_elements * sizeof(int));
 
-    // Flatten Data (Feature-Major Order)
+    // Flatten Data (Feature-Major Order) using Dataview's sorted accessors
     size_t global_idx = 0;
-    const auto& feature_data = cpu_dataset.get_features_data();
-
+    
     for (int f = 0; f < this->num_features; f++) {
-        const auto& current_feat_vec = feature_data[f];
-        for (int i = 0; i < this->num_instances; i++) {
-            const auto& element = current_feat_vec[i];
-            
+        const auto& feature_vec = dataview.get_sorted_dataset_feature(f);
+        for (const auto& element : feature_vec) {
             h_values[global_idx] = element.value;
             h_labels[global_idx] = element.label;
             h_indices[global_idx] = element.data_point_index;
@@ -173,7 +165,6 @@ __device__ int calculate_misclassification(int* counts, int num_classes, int tot
     return total_count - max_freq;
 }
 
-// Kernel: Compute Best Splits using Shared Memory Reduction
 __global__ void compute_splits_kernel(
     const float* __restrict__ values,
     const int* __restrict__ labels,
@@ -235,7 +226,6 @@ __global__ void compute_splits_kernel(
         __syncthreads();
     }
 
-    // Prepare starting counts (Exclusive Scan)
     int my_starting_counts[MAX_COUNTERS]; 
     if (tid > 0) {
         for (int c = 0; c < num_counters_per_thread; ++c) my_starting_counts[c] = shared_counts[(tid - 1) * num_counters_per_thread + c];
@@ -243,14 +233,12 @@ __global__ void compute_splits_kernel(
         for(int c = 0; c < num_counters_per_thread; ++c) my_starting_counts[c] = 0;
     }
     
-    // Total Counts
     __shared__ int total_counts[MAX_COUNTERS]; 
     if (tid == bdim - 1) {
         for (int c = 0; c < num_counters_per_thread; ++c) total_counts[c] = shared_counts[tid * num_counters_per_thread + c];
     }
     __syncthreads();
 
-    // Leaf Scores (Thread 0)
     if (tid == 0) {
         int total_L_size = 0; int total_R_size = 0;
         for(int c=0; c<num_classes; ++c) {
@@ -302,7 +290,6 @@ __global__ void compute_splits_kernel(
         
         if (value_changed && i > 0) { 
             float threshold = (prev_value + val) * 0.5f;
-            // Left Child
             if (curr_L_size > 0 && curr_L_size < total_L_size) {
                 int l_lbl;
                 int score_L = calculate_misclassification(curr_counts_L, num_classes, curr_L_size, l_lbl);
@@ -312,7 +299,6 @@ __global__ void compute_splits_kernel(
                 int total_score = score_L + score_R;
                 if (total_score < local_best_score_L) { local_best_score_L = total_score; local_best_thresh_L = threshold; local_best_lL_L = l_lbl; local_best_lR_L = rem_lbl; local_best_cL_L = score_L; local_best_cR_L = score_R; }
             }
-            // Right Child
             if (curr_R_size > 0 && curr_R_size < total_R_size) {
                 int l_lbl;
                 int score_L = calculate_misclassification(curr_counts_R, num_classes, curr_R_size, l_lbl);
@@ -328,7 +314,6 @@ __global__ void compute_splits_kernel(
         prev_value = val;
     }
 
-    // Parallel Reduction for Best Scores
     __syncthreads(); shared_counts[tid] = local_best_score_L; __syncthreads();
     if (tid == 0) {
         int best_score = leaf_scores_left[feature_idx]; int best_t = -1;
@@ -355,8 +340,6 @@ __global__ void compute_splits_kernel(
 void prepare_gpu_view(const Dataview& cpu_view, GPUDataview& gpu_view) {
     if (gpu_view.d_values != nullptr) return;
 
-    // Use recursion_buffers[0] as scratch space/storage for the root view
-    // Ensure allocate_recursion_buffers was called before this!
     if (recursion_buffers.empty()) {
         std::cerr << "Error: Recursion buffers not allocated." << std::endl;
         return;
@@ -400,8 +383,6 @@ void run_specialized_solver_gpu(
     int split_feature_index,
     float split_threshold,
     int upper_bound,
-    
-    // Outputs
     int* h_best_scores_left, float* h_best_thresholds_left, int* h_best_labels_left_L, int* h_best_labels_left_R, int* h_best_child_scores_left_L, int* h_best_child_scores_left_R, int* h_leaf_scores_left, int* h_leaf_labels_left,
     int* h_best_scores_right, float* h_best_thresholds_right, int* h_best_labels_right_L, int* h_best_labels_right_R, int* h_best_child_scores_right_L, int* h_best_child_scores_right_R, int* h_leaf_scores_right, int* h_leaf_labels_right,
     bool fetch_full_results
@@ -409,12 +390,11 @@ void run_specialized_solver_gpu(
     if (active_view.num_classes > MAX_CLASSES) { std::cerr << "ERR: Class limit exceeded" << std::endl; exit(1); }
 
     int* d_assignment_map = global_gpu_dataset.d_assignment_buffer; 
-    
+
     int block = 256;
     int grid = (active_view.num_instances + block - 1) / block;
 
     if (split_feature_index == -1) {
-        // Root case: Set map to 0
         cudaMemset(d_assignment_map, 0, active_view.num_instances * sizeof(int));
     } else {
         float* split_feature_col = active_view.d_values + (size_t)split_feature_index * active_view.num_instances;
@@ -443,7 +423,6 @@ void run_specialized_solver_gpu(
         global_gpu_dataset.d_score_R, global_gpu_dataset.d_thresh_R, global_gpu_dataset.d_lbl_R_L, global_gpu_dataset.d_lbl_R_R, global_gpu_dataset.d_cscore_R_L, global_gpu_dataset.d_cscore_R_R, global_gpu_dataset.d_leaf_R, global_gpu_dataset.d_leaflbl_R
     );
 
-    // 4. Copy Back
     size_t int_bytes = active_view.num_features * sizeof(int); 
     size_t float_bytes = active_view.num_features * sizeof(float);
 
