@@ -2,7 +2,7 @@
 #define DATAVIEW_H
 
 #include <vector>
-
+#include <mutex>
 #include "dataset.h"
 #include "dynamic_bitset.h"
 
@@ -53,6 +53,8 @@ public:
     static void initialize_split_parameters(const std::vector<Dataset::FeatureElement>& current_feature, int class_number, const std::vector<int>& current_label_frequency, int split_point, std::vector<int> &left_label_frequency, std::vector<int> &right_label_frequency);
 
     DataviewBitset& get_bitset() const {
+        // Thread-safe Lazy Initialization
+        std::lock_guard<std::mutex> lock(bitset_mutex);
         if (!bitset.is_bitset_set()) bitset = DataviewBitset(*this);
         return bitset;
     }
@@ -74,6 +76,7 @@ private:
     Dataset* unsorted_dataset; 
 
     mutable DataviewBitset bitset;
+    mutable std::mutex bitset_mutex; // Add mutex
 
     const bool sort_by_gini_index;
 };

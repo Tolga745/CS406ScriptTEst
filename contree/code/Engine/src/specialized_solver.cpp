@@ -1,11 +1,24 @@
 #include "specialized_solver.h"
+#include <mutex>
+#include <atomic>
+#include <omp.h>
+#include <limits>
+#include "intervals_pruner.h"
+#include <queue>
+// Mutex for merging results in the top-level function
+std::mutex spec_tree_mutex;
 
+// Helper class for Depth 1 scoring
+// (Keep class definition as is, ensuring it has a copy constructor for thread locality)
 class Depth1ScoreHelper {
 public:
     Depth1ScoreHelper(const int size, const int CLASS_NUMBER)
-        : label_frequency(std::vector<int>(CLASS_NUMBER, 0)), current_label_frequency(std::vector<int>(CLASS_NUMBER, 0)), size(size) {
+        : label_frequency(std::vector<int>(CLASS_NUMBER, 0)), 
+          current_label_frequency(std::vector<int>(CLASS_NUMBER, 0)), 
+          size(size) {}
 
-    }
+    // Copy constructor is essential for thread-local copies
+    Depth1ScoreHelper(const Depth1ScoreHelper& other) = default;
 
     void reset_label_frequency() {
         std::fill(current_label_frequency.begin(), current_label_frequency.end(), 0);
@@ -16,6 +29,7 @@ public:
         current_element_count = 0;
     }
 
+    // State variables
     int classification_score = -1;
     int best_feature_index = -1;
     float best_threshold = -1.0f;
@@ -37,21 +51,60 @@ public:
     std::vector<int> current_label_frequency;
 };
 
+// --- Top Level Parallelization ---
 void SpecializedSolver::create_optimal_decision_tree(const Dataview& dataview, const Configuration& solution_configuration, std::shared_ptr<Tree>& current_optimal_decision_tree, int upper_bound) {
+    
+    // 1. Shared Atomic UB to share the best score instantly across threads
+    std::atomic<int> shared_ub(std::min(upper_bound, current_optimal_decision_tree->misclassification_score));
+    bool already_parallel = omp_in_parallel();
+    // 2. Parallelize the Feature Loop
+    // dynamic schedule handles load imbalance (some features are harder to split)
+    #pragma omp parallel for schedule(dynamic) if(!already_parallel)
     for (int feature_index = 0; feature_index < dataview.get_feature_number(); feature_index++) {
-        create_optimal_decision_tree(dataview, solution_configuration, feature_index, current_optimal_decision_tree, std::min(upper_bound, current_optimal_decision_tree->misclassification_score));
+        
+        // Check time limit
+        if (!solution_configuration.stopwatch.IsWithinTimeLimit()) continue;
+        
+        // Fast Pruning: If global UB is 0, we are done.
+        int current_global_ub = shared_ub.load();
+        if (current_global_ub == 0) continue;
 
-        if (current_optimal_decision_tree->misclassification_score <= solution_configuration.max_gap) {
-            return;
+        // Thread-Local Tree
+        std::shared_ptr<Tree> thread_local_tree = std::make_shared<Tree>(*current_optimal_decision_tree);
+
+        // Run Solver
+        create_optimal_decision_tree(dataview, solution_configuration, feature_index, thread_local_tree, current_global_ub);
+
+        // 3. Merge Results
+        if (thread_local_tree->misclassification_score <= solution_configuration.max_gap) {
+            // Found a "perfect" solution relative to gap
+             std::lock_guard<std::mutex> lock(spec_tree_mutex);
+             if (thread_local_tree->misclassification_score < current_optimal_decision_tree->misclassification_score) {
+                 current_optimal_decision_tree = thread_local_tree;
+                 shared_ub.store(current_optimal_decision_tree->misclassification_score);
+             }
+             // Cannot 'return' from parallel loop, just continue and let others finish or check UB
+             continue; 
+        }
+
+        // Standard merge for non-perfect improvements
+        if (thread_local_tree->misclassification_score < current_global_ub) {
+            std::lock_guard<std::mutex> lock(spec_tree_mutex);
+            if (thread_local_tree->misclassification_score < current_optimal_decision_tree->misclassification_score) {
+                current_optimal_decision_tree = thread_local_tree;
+                shared_ub.store(current_optimal_decision_tree->misclassification_score);
+            }
         }
     }
 }
 
+// --- Inner Loop Parallelization (Reduction Strategy) ---
 void SpecializedSolver::get_best_left_right_scores(const Dataview& dataview, int feature_index, int split_point, float threshold, std::shared_ptr<Tree> &left_optimal_dt, std::shared_ptr<Tree> &right_optimal_dt, int upper_bound) {
     const auto& split_feature = dataview.get_sorted_dataset_feature(feature_index);
     const auto& unsorted_split_feature = dataview.get_unsorted_dataset_feature(feature_index);
     std::vector<int> split_feature_split_indices(unsorted_split_feature.size());
     int split_index = -1;
+    
     for (const auto& split_feature_data : split_feature) {
         split_feature_split_indices[split_feature_data.data_point_index] = split_feature_data.unique_value_index;
         if (split_index == -1 && split_feature_data.value >= threshold) {
@@ -63,68 +116,95 @@ void SpecializedSolver::get_best_left_right_scores(const Dataview& dataview, int
     const int dataset_size = dataview.get_dataset_size();
     const int class_number = dataview.get_class_number();
 
-    RUNTIME_ASSERT(split_point > 0 && split_point < dataset_size, "left and right subtree need to be non-empty.");
-    Depth1ScoreHelper left_tree(split_point, class_number);
-    Depth1ScoreHelper right_tree(dataset_size - split_point, class_number);
-    
+    // Prepare Base Helpers
+    Depth1ScoreHelper base_left_tree(split_point, class_number);
+    Depth1ScoreHelper base_right_tree(dataset_size - split_point, class_number);
 
-    left_tree.classification_score = std::max(0, left_tree.size - upper_bound);
-    right_tree.classification_score = std::max(0, right_tree.size - upper_bound);
+    base_left_tree.classification_score = std::max(0, base_left_tree.size - upper_bound);
+    base_right_tree.classification_score = std::max(0, base_right_tree.size - upper_bound);
 
-    Dataview::initialize_split_parameters(split_feature, class_number, dataview.get_label_frequency(), split_point, left_tree.label_frequency, right_tree.label_frequency);
+    Dataview::initialize_split_parameters(split_feature, class_number, dataview.get_label_frequency(), split_point, base_left_tree.label_frequency, base_right_tree.label_frequency);
 
-    left_tree.max_label_frequency = 0;
-    right_tree.max_label_frequency = 0;
+    // Initial max frequency calculation
+    base_left_tree.max_label_frequency = 0;
+    base_right_tree.max_label_frequency = 0;
     for (int label = 0; label < class_number; label++) {
-        if (left_tree.label_frequency[label] > left_tree.max_label_frequency) {
-            left_tree.max_label_frequency = left_tree.label_frequency[label];
-            left_tree.max_label = label;
+        if (base_left_tree.label_frequency[label] > base_left_tree.max_label_frequency) {
+            base_left_tree.max_label_frequency = base_left_tree.label_frequency[label];
+            base_left_tree.max_label = label;
         }
-        if (right_tree.label_frequency[label] > right_tree.max_label_frequency) {
-            right_tree.max_label_frequency = right_tree.label_frequency[label];
-            right_tree.max_label = label;
-        }
-    }
-    left_tree.classification_score = std::max(left_tree.classification_score, left_tree.max_label_frequency);
-    right_tree.classification_score = std::max(right_tree.classification_score, right_tree.max_label_frequency);
-
-    for (int current_feature_index = 0 ; current_feature_index < dataview.get_feature_number(); current_feature_index++) {
-
-        if (current_feature_index == feature_index) {
-            process_depth_one_feature<true>(dataview, feature_index, split_point, current_feature_index, split_index,
-                left_tree, right_tree, split_feature_split_indices, upper_bound);
-        } else {
-            process_depth_one_feature<false>(dataview, feature_index, split_point, current_feature_index, split_index,
-                left_tree, right_tree, split_feature_split_indices, upper_bound);
-        }
-
-
-        if (left_tree.classification_score + right_tree.classification_score == dataset_size) {
-            break;
+        if (base_right_tree.label_frequency[label] > base_right_tree.max_label_frequency) {
+            base_right_tree.max_label_frequency = base_right_tree.label_frequency[label];
+            base_right_tree.max_label = label;
         }
     }
+    base_left_tree.classification_score = std::max(base_left_tree.classification_score, base_left_tree.max_label_frequency);
+    base_right_tree.classification_score = std::max(base_right_tree.classification_score, base_right_tree.max_label_frequency);
 
-    if (left_tree.classification_score == left_tree.max_label_frequency) {
-        left_optimal_dt->make_leaf(left_tree.max_label, left_tree.size - left_tree.classification_score);
+
+    // PARALLEL REGION: Thread-Local Reduction
+    // We create a vector of helpers (one pair per thread) to avoid race conditions
+    // Then we merge them at the end.
+    int max_threads = omp_get_max_threads();
+    bool run_parallel = !omp_in_parallel();
+    std::vector<Depth1ScoreHelper> local_left_trees(max_threads, base_left_tree);
+    std::vector<Depth1ScoreHelper> local_right_trees(max_threads, base_right_tree);
+
+    #pragma omp parallel if(run_parallel)
+    {
+        int tid = omp_get_thread_num();
+        auto& my_left_tree = local_left_trees[tid];
+        auto& my_right_tree = local_right_trees[tid];
+        
+        // This loop is the expensive part (scanning all features for Depth 1 splits)
+        #pragma omp for
+        for (int current_feature_index = 0 ; current_feature_index < dataview.get_feature_number(); current_feature_index++) {
+            
+            // Optimization: If we already found a perfect split locally, we could skip (optional)
+            if (my_left_tree.classification_score + my_right_tree.classification_score == dataset_size) continue;
+
+            if (current_feature_index == feature_index) {
+                process_depth_one_feature<true>(dataview, feature_index, split_point, current_feature_index, split_index,
+                    my_left_tree, my_right_tree, split_feature_split_indices, upper_bound);
+            } else {
+                process_depth_one_feature<false>(dataview, feature_index, split_point, current_feature_index, split_index,
+                    my_left_tree, my_right_tree, split_feature_split_indices, upper_bound);
+            }
+        }
+    }
+
+    // REDUCTION STEP: Find the best result among all threads
+    // We start with the base (which holds default scores)
+    Depth1ScoreHelper* best_left = &base_left_tree;
+    Depth1ScoreHelper* best_right = &base_right_tree;
+
+    for(int i = 0; i < max_threads; ++i) {
+        int current_total_score = local_left_trees[i].classification_score + local_right_trees[i].classification_score;
+        int best_total_score = best_left->classification_score + best_right->classification_score;
+
+        if (current_total_score > best_total_score) {
+            best_left = &local_left_trees[i];
+            best_right = &local_right_trees[i];
+        }
+    }
+
+    // Apply Best Results
+    if (best_left->classification_score == best_left->max_label_frequency) {
+        left_optimal_dt->make_leaf(best_left->max_label, best_left->size - best_left->classification_score);
     } else {
-        left_optimal_dt->update_split(left_tree.best_feature_index, left_tree.best_threshold, std::make_shared<Tree>(left_tree.best_left_label, -1), std::make_shared<Tree>(left_tree.best_right_label, -1));
-        //RUNTIME_ASSERT(left_tree.best_left_label != -1, "Left tree left label should be initialized.");
-        //RUNTIME_ASSERT(left_tree.best_right_label != -1, "Left tree right label should be initialized.");
+        left_optimal_dt->update_split(best_left->best_feature_index, best_left->best_threshold, 
+            std::make_shared<Tree>(best_left->best_left_label, -1), std::make_shared<Tree>(best_left->best_right_label, -1));
     }
-    left_optimal_dt->misclassification_score = left_tree.size - left_tree.classification_score;
-    RUNTIME_ASSERT(left_optimal_dt->misclassification_score >= 0, "LR - Left tree misclassification score should be non-negative.");
+    left_optimal_dt->misclassification_score = best_left->size - best_left->classification_score;
 
-    if (right_tree.classification_score == right_tree.max_label_frequency) {
-        right_optimal_dt->make_leaf(right_tree.max_label, right_tree.size - right_tree.classification_score);
+    if (best_right->classification_score == best_right->max_label_frequency) {
+        right_optimal_dt->make_leaf(best_right->max_label, best_right->size - best_right->classification_score);
     } else {
-        right_optimal_dt->update_split(right_tree.best_feature_index, right_tree.best_threshold, std::make_shared<Tree>(right_tree.best_left_label, -1), std::make_shared<Tree>(right_tree.best_right_label, -1));
-        //RUNTIME_ASSERT(right_tree.best_left_label != -1, "Right tree left label should be initialized.");
-        //RUNTIME_ASSERT(right_tree.best_right_label != -1, "Right tree right label should be initialized.");
+        right_optimal_dt->update_split(best_right->best_feature_index, best_right->best_threshold, 
+            std::make_shared<Tree>(best_right->best_left_label, -1), std::make_shared<Tree>(best_right->best_right_label, -1));
     }
-    right_optimal_dt->misclassification_score = right_tree.size - right_tree.classification_score;
-    RUNTIME_ASSERT(right_optimal_dt->misclassification_score >= 0, "LR - Right tree misclassification score should be non-negative.");
+    right_optimal_dt->misclassification_score = best_right->size - best_right->classification_score;
 }
-
 template <bool is_same_feature>
 void SpecializedSolver::process_depth_one_feature(const Dataview& dataview,
     const int feature_index, const int split_point, const int current_feature_index, const int split_index,

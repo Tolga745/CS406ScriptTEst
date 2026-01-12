@@ -5,7 +5,7 @@
 #include <variant>
 #include <algorithm>
 #include "parameter_handler.h"
-#include "general_solver.h"
+#include "general_solver_version23.h"
 #include "dataset.h"
 #include "configuration.h"
 #include "statistics.h"
@@ -14,6 +14,10 @@
 namespace py = pybind11;
 using namespace std;
 
+// reads x and y from python numpy and convert them to contree format
+// features -> list of sorted (value, instance_id) pairs
+// labels -> per-instance class
+// pre-processing - won't be parallelized
 void NumpyToConTreeData(const py::array_t<double, py::array::c_style>& _X,
     const py::array_t<int, py::array::c_style>& _y, Dataset& data, int& class_number) {
     

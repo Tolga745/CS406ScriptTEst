@@ -8,7 +8,7 @@
 #include "dataset.h"
 #include "dataview.h"
 #include "file_reader.h"
-#include "general_solver.h"
+#include "general_solver_version23.h"
 #include "parameter_handler.h"
 #include "statistics.h"
 #include "tree.h"
@@ -36,7 +36,7 @@ void create_optimal_decision_tree(std::string file_name, int run_number, Configu
         optimal_decision_tree = std::make_shared<Tree>();
         int max_gap = config.max_gap;
         do {
-            Cache::global_cache = Cache(config.max_depth, unsorted_dataset.get_instance_number());
+            Cache::global_cache.resize(config.max_depth, unsorted_dataset.get_instance_number());
             config.is_root = true;
             GeneralSolver::create_optimal_decision_tree(dataview, config, optimal_decision_tree, INT_MAX);
 
@@ -66,7 +66,7 @@ void create_optimal_decision_tree(std::string file_name, int run_number, Configu
 
 int main(int argc, char *argv[]) {
     ParameterHandler parameters = ParameterHandler::DefineParameters();
-    //Adding comment to check script
+
     bool verbose = true;
     if (argc <= 1) {
         std::cout << "No parameters specified." << std::endl << std::endl;
