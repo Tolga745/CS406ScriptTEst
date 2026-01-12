@@ -48,6 +48,8 @@ file(GLOB SRC_FILES
     ${CMAKE_CURRENT_SOURCE_DIR}/Utilities/src/*.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/Engine/src/*.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/main.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/Engine/src/gpu_solver.cu
+    ${CMAKE_CURRENT_SOURCE_DIR}/DataStructures/src/gpu_dataview.cu
 )
 
 # Define include directories
@@ -55,8 +57,7 @@ set(INCLUDE_DIRS
     ${CMAKE_SOURCE_DIR}/Utilities/include
     ${CMAKE_SOURCE_DIR}/DataStructures/include
     ${CMAKE_SOURCE_DIR}/Engine/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/Engine/src/gpu_solver.cu
-    ${CMAKE_CURRENT_SOURCE_DIR}/DataStructures/src/gpu_dataview.cu
+    
 )
 
 # Specify include directories
