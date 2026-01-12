@@ -17,7 +17,7 @@
 // --- TUNING PARAMETERS ---
 // If a node has fewer than this many rows, we skip the GPU and use CPU.
 // GPU overhead (malloc, kernel launch) usually kills performance below 20k-50k rows.
-static const int GPU_MIN_INSTANCES = 20000; 
+static const int GPU_MIN_INSTANCES = 45000; 
 
 // Set to true to see timing logs in your console
 static const bool DEBUG_PERFORMANCE = true; 
