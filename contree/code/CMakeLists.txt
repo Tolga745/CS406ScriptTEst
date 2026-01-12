@@ -36,7 +36,7 @@ if (CMAKE_BUILD_TYPE STREQUAL Release)
         add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-funroll-loops>)
         
         # Optional: Add this to fix the "serial compilation" LTO warning
-        add_compile_options(-flto=auto) 
+        add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-flto=auto>)
     endif()
 
 endif()
