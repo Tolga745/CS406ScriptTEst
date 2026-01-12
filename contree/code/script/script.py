@@ -12,7 +12,7 @@ from datetime import datetime
 #   /script/script.py  <-- You are here
 #   /datasets/
 DATASET_FOLDER = "../datasets"
-BINARY_PARALLEL = "../code/build/ConTree"
+BINARY_PARALLEL = "../build/ConTree"
 
 BASELINE_TXT = "./baseline.txt"
 TIME_LIMIT = "600"
