@@ -13,8 +13,6 @@
 #include "statistics.h"
 #include "tree.h"
 
-#include "gpu_solver.cuh"
-
 void create_optimal_decision_tree(std::string file_name, int run_number, Configuration& config, double runtime_limit) {
     long long total_time = 0;
     int instance_number = -1;
@@ -33,27 +31,18 @@ void create_optimal_decision_tree(std::string file_name, int run_number, Configu
 
         sorted_dataset.sort_feature_values();
 
-        global_gpu_dataset.initialize(sorted_dataset);
-
-        allocate_recursion_buffers(config.max_depth, sorted_dataset.get_instance_number(), sorted_dataset.get_features_size());
-
         Dataview dataview = Dataview(&sorted_dataset, &unsorted_dataset, class_number, config.sort_gini);
-
 
         optimal_decision_tree = std::make_shared<Tree>();
         int max_gap = config.max_gap;
         do {
-            Cache::global_cache = Cache(config.max_depth, unsorted_dataset.get_instance_number());
+            Cache::global_cache.resize(config.max_depth, unsorted_dataset.get_instance_number());
             config.is_root = true;
             GeneralSolver::create_optimal_decision_tree(dataview, config, optimal_decision_tree, INT_MAX);
 
             max_gap = int(max_gap * config.max_gap_decay);
         } while (max_gap > 0);
 
-
-        free_recursion_buffers();
-
-        global_gpu_dataset.free();
         auto stop = std::chrono::high_resolution_clock::now();
         auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(stop - start);
         total_time += duration.count();
@@ -77,7 +66,7 @@ void create_optimal_decision_tree(std::string file_name, int run_number, Configu
 
 int main(int argc, char *argv[]) {
     ParameterHandler parameters = ParameterHandler::DefineParameters();
-    //Adding comment to check script
+
     bool verbose = true;
     if (argc <= 1) {
         std::cout << "No parameters specified." << std::endl << std::endl;

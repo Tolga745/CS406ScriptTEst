@@ -2,13 +2,11 @@
 #define DATAVIEW_H
 
 #include <vector>
-
+#include <mutex>
 #include "dataset.h"
 #include "dynamic_bitset.h"
-#include "gpu_structs.h"
 
 class Dataview;
-
 
 struct DataviewBitset {
     dynamic_bitset bitset;
@@ -39,12 +37,6 @@ class Dataview {
 public:
     Dataview(int class_number, const bool sort_by_gini_index) : label_frequency(class_number, 0), class_number(class_number), sort_by_gini_index(sort_by_gini_index) {};
     Dataview(Dataset* sorted_dataset, Dataset* unsorted_dataset, int class_number, const bool sort_by_gini_index);
-    
-    ~Dataview() {
-        gpu_view.free();
-    }
-    
-    GPUDataview gpu_view;
 
     int get_dataset_size() const;
     int get_feature_number() const;
@@ -59,10 +51,10 @@ public:
 
     static void split_data_points(const Dataview& current_dataview, int feature_index, int split_point, int split_unique_value_index, Dataview& left_data, Dataview& right_data, int current_max_depth);
     static void initialize_split_parameters(const std::vector<Dataset::FeatureElement>& current_feature, int class_number, const std::vector<int>& current_label_frequency, int split_point, std::vector<int> &left_label_frequency, std::vector<int> &right_label_frequency);
-    
-    
 
     DataviewBitset& get_bitset() const {
+        // Thread-safe Lazy Initialization
+        std::lock_guard<std::mutex> lock(bitset_mutex);
         if (!bitset.is_bitset_set()) bitset = DataviewBitset(*this);
         return bitset;
     }
@@ -84,6 +76,7 @@ private:
     Dataset* unsorted_dataset; 
 
     mutable DataviewBitset bitset;
+    mutable std::mutex bitset_mutex; // Add mutex
 
     const bool sort_by_gini_index;
 };

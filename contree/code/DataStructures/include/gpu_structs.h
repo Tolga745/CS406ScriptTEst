@@ -1,7 +1,6 @@
-// code/DataStructures/include/gpu_structs.h
 #pragma once
 
-// Note: We do NOT include cuda_runtime.h here to keep it C++ compatible.
+// Note: We do NOT include cuda_runtime.h here to keep it C++ compatible for host compilers.
 // The pointers (float*, int*) are standard types.
 
 struct GpuDataset {
@@ -15,7 +14,7 @@ struct GpuDataset {
     int num_instances = 0;
     size_t total_elements = 0; 
 
-    // Declaration only - implementation moves to .cu file
+    // Declaration only - implementation in .cu file
     void free();
 };
 
@@ -31,6 +30,7 @@ struct GPUDataview {
     int num_classes = 0;
 
     bool owns_memory = true;
-    // Declaration only - implementation moves to .cu file
+    
+    // Declaration only - implementation in .cu file
     void free();
 };

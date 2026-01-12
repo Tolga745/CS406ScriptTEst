@@ -111,6 +111,7 @@ Dataview::Dataview(Dataset* sorted_dataset, Dataset* unsorted_dataset, int class
             return a.first < b.first;
         });
     }
+    this->bitset.set_hash(std::hash<DataviewBitset>()(this->bitset));
 }
 int Dataview::get_dataset_size() const {
     return int(feature_data[0].size());
@@ -140,154 +141,113 @@ const std::vector<int>& Dataview::get_possible_split_indices(int feature_index) 
     return possible_split_indices[feature_index];
 }
 
-void Dataview::split_data_points(const Dataview& current_dataview, int feature_index, int split_point, int split_unique_value_index, Dataview& left_dataview, Dataview& right_dataview, int current_max_depth) {
-    int num_features = current_dataview.get_feature_number();
-    
-    // Pre-allocate everything (Main Thread)
+void Dataview::split_data_points(
+    const Dataview& current_dataview,
+    int feature_index,
+    int split_point,
+    int split_unique_value_index,
+    Dataview& left_dataview,
+    Dataview& right_dataview,
+    int current_max_depth
+) {
+    const int num_features = current_dataview.get_feature_number();
+    const int class_number = current_dataview.get_class_number();
+
+    // Pre-allocate feature containers
     left_dataview.feature_data.resize(num_features);
     right_dataview.feature_data.resize(num_features);
+
     left_dataview.possible_split_indices.resize(num_features);
     right_dataview.possible_split_indices.resize(num_features);
+
     left_dataview.gini_values.resize(num_features);
     right_dataview.gini_values.resize(num_features);
 
-    const int class_number = current_dataview.get_class_number();
-    const auto& current_feature = current_dataview.get_sorted_dataset_feature(feature_index);
-    
-    // unsorted_dataset is shared read-only, safe to access
-    const auto& unsorted_split_feature = current_dataview.unsorted_dataset->feature_data[feature_index];
+    left_dataview.label_frequency.assign(class_number, 0);
+    right_dataview.label_frequency.assign(class_number, 0);
 
-    Dataview::initialize_split_parameters(current_feature, class_number, current_dataview.label_frequency, split_point, left_dataview.label_frequency, right_dataview.label_frequency);
 
-    int left_size = split_point;
-    int right_size = int(current_feature.size()) - split_point;
+    const auto& unsorted_split_feature =
+        current_dataview.unsorted_dataset->feature_data[feature_index];
 
-    // --- PARALLELIZATION START ---
-    // We replaced the iterator loop with an index-based loop to enable OpenMP
+    // Serial: label frequencies for new views
+    Dataview::initialize_split_parameters(
+        current_dataview.get_sorted_dataset_feature(feature_index),
+        class_number,
+        current_dataview.label_frequency,
+        split_point,
+        left_dataview.label_frequency,
+        right_dataview.label_frequency
+    );
+
+    const int left_size  = split_point;
+    const int right_size = current_dataview.get_dataset_size() - split_point;
+
+    // --- PARALLEL DATA SHUFFLING ---
     #pragma omp parallel for schedule(static)
     for (int feature_no = 0; feature_no < num_features; feature_no++) {
-        
-        // Direct access to source data (Read-Only)
-        const auto& it = current_dataview.feature_data[feature_no];
+        const auto& src_data = current_dataview.feature_data[feature_no];
 
-        // Direct access to destination data (Write-Only, Disjoint)
-        auto& left_split_feature_data = left_dataview.feature_data[feature_no];
-        left_split_feature_data.resize(left_size); // Each thread resizes its own vector
+        auto& l_data = left_dataview.feature_data[feature_no];
+        auto& r_data = right_dataview.feature_data[feature_no];
 
-        auto& right_split_feature_data = right_dataview.feature_data[feature_no];
-        right_split_feature_data.resize(right_size);
-        
-        // Thread-local temporary vectors
-        std::vector<int> left_value_change_indices; left_value_change_indices.reserve(it.size());
-        std::vector<int> right_value_change_indices; right_value_change_indices.reserve(it.size());
+        l_data.resize(left_size);
+        r_data.resize(right_size);
 
-        int left_last_unique_index = -1;
-        int rigth_last_unique_index = -1;
-        int left_counter = 0;
-        int right_counter = 0;
-        float left_best_gini = 1.0f;
-        float right_best_gini = 1.0f;
+        int l_ptr = 0;
+        int r_ptr = 0;
+        int l_last_idx = -1;
+        int r_last_idx = -1;
 
-        // Thread-local frequency counters
-        std::vector<int> left_tree_left_label_frequency(class_number, 0);
-        std::vector<int> left_tree_right_label_frequency(left_dataview.label_frequency); // Copy global
-        std::vector<int> right_tree_left_label_frequency(class_number, 0);
-        std::vector<int> right_tree_right_label_frequency(right_dataview.label_frequency); // Copy global
+        std::vector<int> l_splits;
+        std::vector<int> r_splits;
+        l_splits.reserve(src_data.size() / 8);
+        r_splits.reserve(src_data.size() / 8);
 
-        for (const auto& feature_data : it) {
-            // Shared Read: unsorted_split_feature is valid here
-            if (unsorted_split_feature[feature_data.data_point_index].unique_value_index >= split_unique_value_index) {
-                // RIGHT SIDE
-                right_split_feature_data[right_counter] = feature_data;
+        for (const auto& element : src_data) {
+            if (unsorted_split_feature[element.data_point_index].unique_value_index >= split_unique_value_index) {
+                r_data[r_ptr] = element;
 
-                if (feature_data.unique_value_index != rigth_last_unique_index && rigth_last_unique_index != -1) {
-                    right_value_change_indices.emplace_back(right_counter);
+                if (element.unique_value_index != r_last_idx && r_last_idx != -1) {
+                    r_splits.push_back(r_ptr);
                 }
-                rigth_last_unique_index = feature_data.unique_value_index;
-                right_counter++;
-
-                if (current_dataview.sort_by_gini_index) {
-                    right_tree_right_label_frequency[feature_data.label]--;
-                    right_tree_left_label_frequency[feature_data.label]++;
-                    
-                    // ... Gini Math (same as original) ...
-                    float l_gini = 1.0f; float r_gini = 1.0f;
-                    int l_count = right_counter; 
-                    int r_count = int(current_feature.size()) - l_count;
-                    
-                    for (int label = 0; label < class_number; label++) {
-                        if (l_count > 0) {
-                            float p = (float)right_tree_left_label_frequency[label] / l_count;
-                            l_gini -= p * p;
-                        }
-                        if (r_count > 0) {
-                            float p = (float)right_tree_right_label_frequency[label] / r_count;
-                            r_gini -= p * p;
-                        }
-                    }
-                    float gini = (l_gini * l_count + r_gini * r_count) / current_feature.size();
-                    if (gini < right_best_gini) right_best_gini = gini;
-                }
+                r_last_idx = element.unique_value_index;
+                r_ptr++;
             } else {
-                // LEFT SIDE
-                left_split_feature_data[left_counter] = feature_data;
+                l_data[l_ptr] = element;
 
-                if (feature_data.unique_value_index != left_last_unique_index && left_last_unique_index != -1) {
-                    left_value_change_indices.emplace_back(left_counter);
+                if (element.unique_value_index != l_last_idx && l_last_idx != -1) {
+                    l_splits.push_back(l_ptr);
                 }
-                left_last_unique_index = feature_data.unique_value_index;
-                left_counter++;
-
-                if (current_dataview.sort_by_gini_index) {
-                    left_tree_right_label_frequency[feature_data.label]--;
-                    left_tree_left_label_frequency[feature_data.label]++;
-
-                    // ... Gini Math ...
-                    float l_gini = 1.0f; float r_gini = 1.0f;
-                    int l_count = left_counter; 
-                    int r_count = int(current_feature.size()) - l_count;
-                    
-                    for (int label = 0; label < class_number; label++) {
-                        if (l_count > 0) {
-                            float p = (float)left_tree_left_label_frequency[label] / l_count;
-                            l_gini -= p * p;
-                        }
-                        if (r_count > 0) {
-                            float p = (float)left_tree_right_label_frequency[label] / r_count;
-                            r_gini -= p * p;
-                        }
-                    }
-                    float gini = (l_gini * l_count + r_gini * r_count) / current_feature.size();
-                    if (gini < left_best_gini) left_best_gini = gini;
-                }
+                l_last_idx = element.unique_value_index;
+                l_ptr++;
             }
         }
 
-        // Move thread-local vectors to final destination
-        // Safe because feature_no is unique to this thread
-        left_dataview.possible_split_indices[feature_no] = std::move(left_value_change_indices);
-        right_dataview.possible_split_indices[feature_no] = std::move(right_value_change_indices);
+        // Optional sanity (debug builds)
+        // RUNTIME_ASSERT(l_ptr == left_size, "Left size mismatch in split_data_points");
+        // RUNTIME_ASSERT(r_ptr == right_size, "Right size mismatch in split_data_points");
 
-        left_dataview.gini_values[feature_no] = {left_best_gini, feature_no};
-        right_dataview.gini_values[feature_no] = {right_best_gini, feature_no};
+        left_dataview.possible_split_indices[feature_no]  = std::move(l_splits);
+        right_dataview.possible_split_indices[feature_no] = std::move(r_splits);
+
+        left_dataview.gini_values[feature_no]  = {1.0f, feature_no};
+        right_dataview.gini_values[feature_no] = {1.0f, feature_no};
     }
-    // --- PARALLELIZATION END ---
-    
 
-    left_dataview.unsorted_dataset = current_dataview.unsorted_dataset;
+    left_dataview.unsorted_dataset  = current_dataview.unsorted_dataset;
     right_dataview.unsorted_dataset = current_dataview.unsorted_dataset;
 
+    // If you depend on gini-based ordering as a heuristic, keep this (optional).
     if (current_dataview.sort_by_gini_index && current_max_depth > 3) {
-        // Sorts must happen sequentially after the parallel region
-        std::sort(left_dataview.gini_values.begin(), left_dataview.gini_values.end(), [](const std::pair<float, int>& a, const std::pair<float, int>& b) {
-            return a.first < b.first;
-        });
+        std::sort(left_dataview.gini_values.begin(), left_dataview.gini_values.end(),
+                  [](const auto& a, const auto& b) { return a.first < b.first; });
 
-        std::sort(right_dataview.gini_values.begin(), right_dataview.gini_values.end(), [](const std::pair<float, int>& a, const std::pair<float, int>& b) {
-            return a.first < b.first;
-        });
+        std::sort(right_dataview.gini_values.begin(), right_dataview.gini_values.end(),
+                  [](const auto& a, const auto& b) { return a.first < b.first; });
     }
 }
+
 
 DataviewBitset::DataviewBitset(const Dataview& dataview) 
     : size(dataview.get_dataset_size()), 

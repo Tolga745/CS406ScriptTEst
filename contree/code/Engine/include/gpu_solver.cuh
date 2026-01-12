@@ -5,6 +5,7 @@
 #include "dataset.h"
 #include "gpu_structs.h"
 
+// Forward declaration
 class Dataview;
 
 struct GPURecursionBuffer {
@@ -36,21 +37,28 @@ struct GPUDataset {
     int* d_assignment_buffer;   // Size: num_instances
     
     // Output Buffers (Size: num_features)
+    // These hold the results of the split evaluation for all features in parallel
     int *d_score_L, *d_lbl_L_L, *d_lbl_L_R, *d_cscore_L_L, *d_cscore_L_R, *d_leaf_L, *d_leaflbl_L;
     float *d_thresh_L;
     int *d_score_R, *d_lbl_R_L, *d_lbl_R_R, *d_cscore_R_L, *d_cscore_R_R, *d_leaf_R, *d_leaflbl_R;
     float *d_thresh_R;
+    
     void initialize(const Dataset& cpu_dataset);
     void free();
 };
 
+// Global instance to hold the GPU copy of the dataset
 extern GPUDataset global_gpu_dataset;
 
+// Helper to move a CPU Dataview to GPU (used for the root node or fallbacks)
 void prepare_gpu_view(const Dataview& cpu_view, GPUDataview& gpu_view);
 
-
+/**
+ * Main entry point for the GPU-based split evaluation.
+ * Calculates the best split for every feature in the active_view.
+ */
 void run_specialized_solver_gpu(
-    const GPUDataview& dataview,
+    const GPUDataview& active_view,
     int split_feature_index,
     float split_threshold,
     int upper_bound,

@@ -5,7 +5,9 @@ project(ConTree LANGUAGES CXX CUDA)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CUDA_STANDARD 14)
 
+# --- [INSERT 1] Find OpenMP Package ---
 find_package(OpenMP REQUIRED)
+# --------------------------------------
 
 include(CheckIPOSupported)
 check_ipo_supported(RESULT ipo_supported OUTPUT ipo_error)
@@ -32,22 +34,20 @@ if (CMAKE_BUILD_TYPE STREQUAL Release)
         add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-O3>)
         add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-march=native>)
         add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-funroll-loops>)
+        
+        # Optional: Add this to fix the "serial compilation" LTO warning
+        add_compile_options(-flto=auto) 
     endif()
 
 endif()
-   
     
-
+    
 # Gather source files
 file(GLOB SRC_FILES
     ${CMAKE_CURRENT_SOURCE_DIR}/DataStructures/src/*.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/Utilities/src/*.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/Engine/src/*.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/main.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/DataStructures/src/dataset.cu
-    ${CMAKE_CURRENT_SOURCE_DIR}/Engine/src/gpu_solver.cu
-    ${CMAKE_CURRENT_SOURCE_DIR}/DataStructures/src/dataset_transfer.cu
-    ${CMAKE_CURRENT_SOURCE_DIR}/DataStructures/src/gpu_dataview.cu
 )
 
 # Define include directories
@@ -55,6 +55,8 @@ set(INCLUDE_DIRS
     ${CMAKE_SOURCE_DIR}/Utilities/include
     ${CMAKE_SOURCE_DIR}/DataStructures/include
     ${CMAKE_SOURCE_DIR}/Engine/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/Engine/src/gpu_solver.cu
+    ${CMAKE_CURRENT_SOURCE_DIR}/DataStructures/src/gpu_dataview.cu
 )
 
 # Specify include directories
@@ -65,12 +67,17 @@ add_executable(ConTree ${SRC_FILES})
 
 target_compile_options(ConTree PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda>)
 
-target_link_libraries(ConTree PUBLIC OpenMP::OpenMP_CXX)
+# --- [INSERT 2] Link OpenMP to the Executable ---
+# This MUST come after add_executable
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(ConTree PUBLIC OpenMP::OpenMP_CXX)
+endif()
+# ------------------------------------------------
 
 # Set target properties based on build type
 if (CMAKE_BUILD_TYPE STREQUAL Release)        
     if( ipo_supported )
-	    message(STATUS "IPO / LTO enabled")    
+        message(STATUS "IPO / LTO enabled")    
         set_property(TARGET ConTree PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
     else()
          message(STATUS "IPO / LTO not supported: <${ipo_error}>")
@@ -85,4 +92,3 @@ else()
         message(STATUS "No profiler")
     endif()
 endif()
-
